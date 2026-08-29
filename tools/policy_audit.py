@@ -7,8 +7,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 PROFILE_AGENT_DIRS = {
-    "global": Path("config.d/opencode/agents"),
-    "agent-core": Path("components/agent-core/.opencode/agents"),
+    # packages/opencode/config/agents is the canonical dotnix package-owned path.
+    # Keep the legacy config.d path as a read-only audit fallback while older
+    # pinned consumers finish migrating; dotnix itself does not need to retain it.
+    "global": (
+        Path("packages/opencode/config/agents"),
+        Path("config.d/opencode/agents"),
+    ),
+    "agent-core": (Path("components/agent-core/.opencode/agents"),),
 }
 SUMMARY_KEYS = ("PASS", "INTENTIONAL_DIFFERENCE", "DIFF", "MISSING")
 
@@ -63,7 +69,8 @@ def _audit_profile_contract(
             lines.append("PASS profile=agent-core model_fallback_policy=absent")
             counts["PASS"] += 1
 
-    agent_dir = consumer_root / PROFILE_AGENT_DIRS[profile]
+    candidates = [consumer_root / relative for relative in PROFILE_AGENT_DIRS[profile]]
+    agent_dir = next((candidate for candidate in candidates if candidate.is_dir()), candidates[0])
     if not agent_dir.is_dir():
         lines.append(f"MISSING UNEXPECTED_DRIFT profile={profile} agent_directory={agent_dir}")
         counts["MISSING"] += 1
