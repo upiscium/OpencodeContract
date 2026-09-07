@@ -40,6 +40,44 @@ class PolicyContractTests(unittest.TestCase):
     def test_policy_is_valid(self) -> None:
         self.assertEqual([], validate_policy(ROOT))
 
+    def test_optional_workers_are_global_noncanonical_and_procedural(self) -> None:
+        optional = self.docs["optional-workers"]
+        contract = optional["contract"]
+        self.assertEqual("global", contract["profile"])
+        self.assertEqual("optional", contract["presence"])
+        self.assertFalse(contract["enabled_by_default"])
+        self.assertEqual("procedural-parent-control", contract["runtime_enforcement"])
+        self.assertEqual(1, contract["retry_limit"])
+        self.assertEqual(2, contract["max_attempts"])
+        self.assertEqual(
+            ["local-investigator", "local-tracer", "local-background"],
+            optional["workers"]["allowed"],
+        )
+
+    def test_parent_evidence_validation_is_fail_closed(self) -> None:
+        evidence = self.docs["optional-workers"]["evidence"]
+        self.assertEqual("parent", evidence["validation_owner"])
+        self.assertEqual("parent-observed-session-events", evidence["tool_call_count_source"])
+        self.assertEqual("untrusted", evidence["worker_output_trust"])
+        self.assertEqual("BLOCKED", evidence["wrong_or_unsupported_result"])
+        self.assertFalse(evidence["wrong_or_unsupported_retry"])
+
+    def test_optional_worker_contract_rejects_unknown_and_retry_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(ROOT / "policy", root / "policy")
+            shutil.copytree(ROOT / "profiles", root / "profiles")
+            path = root / "policy/optional-workers.toml"
+            path.write_text(path.read_text() + "\n[contract.extra]\nenabled = true\n", encoding="utf-8")
+            self.assertTrue(any("optional-workers.contract: unknown fields" in error for error in validate_policy(root)))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(ROOT / "policy", root / "policy")
+            shutil.copytree(ROOT / "profiles", root / "profiles")
+            path = root / "policy/optional-workers.toml"
+            path.write_text(path.read_text().replace("retry_limit = 1", "retry_limit = 2"), encoding="utf-8")
+            self.assertIn("optional-workers.contract.retry_limit: must be 1", validate_policy(root))
+
     def test_malformed_table_is_reported_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

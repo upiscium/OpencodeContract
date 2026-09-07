@@ -1,0 +1,93 @@
+schema_version = 1
+
+# Optional compatibility only. Provider IDs, model literals, endpoints, agent
+# prompts, runtime services, and machine-specific routing remain consumer-owned.
+[contract]
+profile = "global"
+phase = 1
+presence = "optional"
+enabled_by_default = false
+authority = "nonauthoritative-read-only-advisory"
+opt_in = "explicit-manual"
+dispatch = "manual-or-shadow"
+runtime_enforcement = "procedural-parent-control"
+static_audit_guarantee = "declarations-and-configuration-only"
+canonical_substitution = "forbidden"
+automatic_model_fallback = "forbidden"
+fallback = "none"
+failure_result = "BLOCKED"
+max_in_flight = 1
+retry_limit = 1
+max_attempts = 2
+required_tools = ["read", "grep"]
+retry_eligibility = "normal_successful_response_with_required_tool_call_count_0"
+retry_model_policy = "same_agent_same_model_only"
+retry_binding = "same-objective-agent-provider-model-and-required-tool"
+retry_exclusions = [
+  "api_failure",
+  "runtime_failure",
+  "model_failure",
+  "permission_failure",
+  "schema_failure",
+  "wrong_evidence",
+  "blocked_response",
+  "approval_or_decision",
+  "non_normal_response",
+  "required_tool_call_count_gt_0",
+]
+
+[workers]
+allowed = ["local-investigator", "local-tracer", "local-background"]
+role = "read-only advisory"
+canonical = false
+hidden = true
+mode = "subagent"
+
+[permissions]
+default = "deny"
+allowed = ["read", "grep"]
+explicitly_denied = [
+  "glob",
+  "list",
+  "lsp",
+  "bash",
+  "edit",
+  "task",
+  "question",
+  "webfetch",
+  "websearch",
+  "skill",
+  "todowrite",
+  "external_directory",
+  "doom_loop",
+]
+
+[evidence]
+validation_owner = "parent"
+tool_call_count_source = "parent-observed-session-events"
+worker_output_trust = "untrusted"
+required_fields = ["path", "line_or_range", "snippet", "mechanism", "confidence", "unverified_areas"]
+wrong_or_unsupported_result = "BLOCKED"
+wrong_or_unsupported_retry = false
+
+[metrics]
+counters = [
+  "local_task_total",
+  "local_task_completed",
+  "local_task_rejected",
+  "local_task_retried",
+  "local_tool_required_miss",
+  "local_wrong_answer_detected",
+  "local_runtime_failure",
+]
+optional_observations = ["local_task_latency_ms", "local_input_tokens", "local_output_tokens"]
+metadata = [
+  "attempts",
+  "retry_reason",
+  "worker",
+  "configured_model",
+  "required_tool",
+  "required_tool_call_count",
+  "failure_class",
+]
+forbidden_content = ["prompt_text", "file_content", "tool_output"]
