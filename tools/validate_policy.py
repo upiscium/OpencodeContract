@@ -15,6 +15,7 @@ POLICY_FILES = {
     "roles": Path("policy/roles.toml"),
     "model-availability": Path("policy/model-availability.toml"),
     "invariants": Path("policy/invariants.toml"),
+    "optional-workers": Path("policy/optional-workers.toml"),
     "global": Path("profiles/global.toml"),
     "agent-core": Path("profiles/agent-core.toml"),
 }
@@ -57,6 +58,86 @@ def validate_policy(root: Path = ROOT) -> list[str]:
     for name, doc in docs.items():
         if type(doc.get("schema_version")) is not int or doc["schema_version"] != 1:
             errors.append(f"{POLICY_FILES[name]}: schema_version must be 1")
+
+    optional = docs["optional-workers"]
+    expected_optional = {
+        "contract": {
+            "profile": "global",
+            "phase": 1,
+            "presence": "optional",
+            "enabled_by_default": False,
+            "authority": "nonauthoritative-read-only-advisory",
+            "opt_in": "explicit-manual",
+            "dispatch": "manual-or-shadow",
+            "runtime_enforcement": "procedural-parent-control",
+            "static_audit_guarantee": "declarations-and-configuration-only",
+            "canonical_substitution": "forbidden",
+            "automatic_model_fallback": "forbidden",
+            "fallback": "none",
+            "failure_result": "BLOCKED",
+            "max_in_flight": 1,
+            "retry_limit": 1,
+            "max_attempts": 2,
+            "required_tools": ["read", "grep"],
+            "retry_eligibility": "normal_successful_response_with_required_tool_call_count_0",
+            "retry_model_policy": "same_agent_same_model_only",
+            "retry_binding": "same-objective-agent-provider-model-and-required-tool",
+            "retry_exclusions": [
+                "api_failure", "runtime_failure", "model_failure", "permission_failure",
+                "schema_failure", "wrong_evidence", "blocked_response", "approval_or_decision",
+                "non_normal_response", "required_tool_call_count_gt_0",
+            ],
+        },
+        "workers": {
+            "allowed": ["local-investigator", "local-tracer", "local-background"],
+            "role": "read-only advisory", "canonical": False, "hidden": True, "mode": "subagent",
+        },
+        "permissions": {
+            "default": "deny", "allowed": ["read", "grep"],
+            "explicitly_denied": [
+                "glob", "list", "lsp", "bash", "edit", "task", "question", "webfetch",
+                "websearch", "skill", "todowrite", "external_directory", "doom_loop",
+            ],
+        },
+        "evidence": {
+            "validation_owner": "parent",
+            "tool_call_count_source": "parent-observed-session-events",
+            "worker_output_trust": "untrusted",
+            "required_fields": ["path", "line_or_range", "snippet", "mechanism", "confidence", "unverified_areas"],
+            "wrong_or_unsupported_result": "BLOCKED",
+            "wrong_or_unsupported_retry": False,
+        },
+        "metrics": {
+            "counters": [
+                "local_task_total", "local_task_completed", "local_task_rejected",
+                "local_task_retried", "local_tool_required_miss", "local_wrong_answer_detected",
+                "local_runtime_failure",
+            ],
+            "optional_observations": ["local_task_latency_ms", "local_input_tokens", "local_output_tokens"],
+            "metadata": [
+                "attempts", "retry_reason", "worker", "configured_model", "required_tool",
+                "required_tool_call_count", "failure_class",
+            ],
+            "forbidden_content": ["prompt_text", "file_content", "tool_output"],
+        },
+    }
+    expected_top = {"schema_version", *expected_optional}
+    if set(optional) != expected_top:
+        errors.append(f"policy/optional-workers.toml: top-level keys must be exactly {sorted(expected_top)}")
+    for section, expected in expected_optional.items():
+        actual = optional.get(section)
+        if not isinstance(actual, dict):
+            errors.append(f"optional-workers.{section}: must be a table")
+            continue
+        unknown = set(actual) - set(expected)
+        missing = set(expected) - set(actual)
+        if unknown:
+            errors.append(f"optional-workers.{section}: unknown fields {sorted(unknown)}")
+        if missing:
+            errors.append(f"optional-workers.{section}: missing fields {sorted(missing)}")
+        for field, value in expected.items():
+            if field in actual and (type(actual[field]) is not type(value) or actual[field] != value):
+                errors.append(f"optional-workers.{section}.{field}: must be {value!r}")
 
     models = docs["models"].get("models", {})
     families = docs["models"].get("quota_families", {})

@@ -74,6 +74,18 @@ Only three model aliases are canonical:
 
 Provider IDs appear only in `policy/models.toml`. Quota-family metadata is descriptive and is not routing authority. Spark, substitute models, and local models are not part of the canonical policy.
 
+## Optional local-worker compatibility
+
+[`policy/optional-workers.toml`](policy/optional-workers.toml) defines an optional, noncanonical compatibility envelope for the Global profile. The three worker classes are `local-investigator`, `local-tracer`, and `local-background`; they are implementation-owned classes rather than canonical roles or model bindings. A consumer owns provider IDs, endpoints, local model literals, prompts, runtime services, and machine-specific routing. Absence of the extension is conformant and does not change any Sol/Terra/Luna assignment or Agent-Core requirement.
+
+Phase 1 permits explicit manual or shadow dispatch only. Workers are hidden, read-only, nonauthoritative subagents with deny-by-default permissions and only `read` and `grep` allowed. Automatic model fallback, canonical-role substitution, cross-model retry, and implicit routing are forbidden. A required-tool omission may be retried once only after an otherwise normal successful response with zero parent-observed calls to the named tool, using the same objective, agent, provider/model binding, and required tool. Availability, API, runtime, schema, permission, blocked, and wrong-evidence failures return `BLOCKED` without retry or fallback.
+
+The parent validates paths, lines or ranges, snippets, mechanism, confidence, and unverified areas before accepting output. Worker output is untrusted, and tool-call counts come from parent-observed session events rather than worker claims. Metrics contain bounded counters and metadata only, never prompts, file content, or tool output.
+
+OpenCode v1.18.16 does not expose its internal `toolChoice: required` control through the public plugin API. Required-tool selection, one-retry accounting, evidence validation, and single-in-flight dispatch are therefore procedural parent controls in Phase 1—not runtime guarantees. A strict audit validates declarations and static configuration only; it does not prove runtime behavior, model availability, or output correctness.
+
+When a Global extension manifest is present beside the selected profile-owned `opencode.json` and `agents/` directory, strict audit validates the complete bundle: exact worker classes, provider/model resolution, sticky bindings, fail-closed retry declarations, metrics schema, hidden subagent metadata, and exact permissions. The selected agent directory is a closed inventory, so unregistered files—including disguised fallback agents—and partial extension deployment fail strict audit. Repository-local OpenCode layers outside that selected Global bundle remain separately authoritative and are not searched or reclassified. This envelope is tracked by [Issue #5](https://github.com/upiscium/OpenCodePolicy/issues/5).
+
 ## Model availability
 
 Each applicable role has one fixed configured model. Model substitution and alternate-model retry are forbidden, including for quota, rate-limit, usage-limit, or availability failures. No hidden or manually callable model-substitution fallback agent is permitted.
