@@ -261,6 +261,48 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             (consumer / "config.d/opencode/local-workers.toml").unlink()
             self.assert_local_invalid(consumer, "unregistered_agent=forbidden")
 
+    def test_nested_unregistered_agent_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            nested = consumer / "config.d/opencode/agents/extra"
+            nested.mkdir()
+            (nested / "evil.md").write_text("---\nmode: subagent\n---\n", encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, result_exit_code(lines, counts, strict=True))
+            self.assertTrue(
+                any("agent=extra/evil" in line and "unregistered_agent=forbidden" in line for line in lines),
+                lines,
+            )
+
+    def test_nested_fallback_agent_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            nested = consumer / "config.d/opencode/agents/extra"
+            nested.mkdir()
+            (nested / "general-fallback.md").write_text("---\nmode: subagent\n---\n", encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, result_exit_code(lines, counts, strict=True))
+            self.assertTrue(
+                any("agent=extra/general-fallback" in line and "fallback_residue=forbidden" in line for line in lines),
+                lines,
+            )
+
+    def test_nested_agent_symlink_escape_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            consumer = self.make_consumer(root, "global")
+            external = root / "external-agent.md"
+            external.write_text("---\nmode: subagent\n---\n", encoding="utf-8")
+            nested = consumer / "config.d/opencode/agents/extra"
+            nested.mkdir()
+            (nested / "evil.md").symlink_to(external)
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, result_exit_code(lines, counts, strict=True))
+            self.assertTrue(
+                any("agent=extra/evil" in line and "unsafe_path=forbidden" in line for line in lines),
+                lines,
+            )
+
     def test_repository_local_manifest_is_outside_global_audit_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             consumer = self.make_consumer(Path(temporary), "global")
@@ -357,6 +399,18 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             lines, counts = audit_profile("agent-core", consumer, self.documents)
             self.assertEqual(1, counts["DIFF"])
             self.assertTrue(any("fallback_residue=forbidden" in line for line in lines))
+
+    def test_agent_core_symlinked_fallback_escape_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            consumer = self.make_consumer(root, "agent-core")
+            external = root / "external-fallback.md"
+            external.write_text("---\nmode: subagent\n---\n", encoding="utf-8")
+            fallback = consumer / "components/agent-core/.opencode/agents/plan-fallback.md"
+            fallback.symlink_to(external)
+            lines, counts = audit_profile("agent-core", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(any("agent=plan-fallback" in line and "unsafe_path=forbidden" in line for line in lines))
 
     def test_arbitrary_fallback_agent_residue_is_diff(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

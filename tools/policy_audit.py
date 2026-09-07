@@ -98,6 +98,31 @@ def _is_confined_path(path: Path, consumer_root: Path) -> bool:
     return True
 
 
+def _agent_inventory(agent_dir: Path, consumer_root: Path) -> tuple[list[Path], list[Path]]:
+    """Find recursively loadable Markdown while rejecting followed symlinks."""
+    markdown: list[Path] = []
+    unsafe: list[Path] = []
+    for path in sorted(agent_dir.rglob("*")):
+        if path.is_symlink():
+            # OpenCode follows symlinks while scanning agents. Reject Markdown
+            # links and directory links rather than following them out of the
+            # selected profile-owned inventory.
+            if path.suffix == ".md" or path.is_dir():
+                unsafe.append(path)
+            continue
+        if path.is_file() and path.suffix == ".md":
+            if _is_confined_path(path, consumer_root):
+                markdown.append(path)
+            else:
+                unsafe.append(path)
+    return markdown, unsafe
+
+
+def _agent_identity(agent_dir: Path, path: Path) -> str:
+    """Match OpenCode's extension-free, agent-directory-relative identity."""
+    return path.relative_to(agent_dir).with_suffix("").as_posix()
+
+
 def _string_list(value: Any) -> list[str] | None:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
         return None
@@ -271,6 +296,19 @@ def _audit_profile_contract(
         return lines, counts
 
     expected_roles = {role_id for role_id, role in roles.items() if profile in role["profiles"]}
+    agent_markdown, unsafe_inventory_paths = _agent_inventory(agent_dir, consumer_root)
+    if profile == "global":
+        for path in unsafe_inventory_paths:
+            identity = _agent_identity(agent_dir, path)
+            if path.parent == agent_dir and identity in expected_roles:
+                # The canonical flat-path check below owns this diagnostic.
+                continue
+            lines.append(
+                f"DIFF UNEXPECTED_DRIFT profile={profile} agent={identity} "
+                "unsafe_path=forbidden"
+            )
+            counts["DIFF"] += 1
+
     for role_id in sorted(expected_roles):
         assignment = documents[profile]["assignments"][role_id]
         expected_model = models[assignment["primary_model"]]["id"]
@@ -318,14 +356,25 @@ def _audit_profile_contract(
             lines.append(f"INTENTIONAL_DIFFERENCE profile={profile} role={role_id} expected=absent")
             counts["INTENTIONAL_DIFFERENCE"] += 1
 
-    fallback_residue = sorted(agent_dir.glob("*-fallback.md"))
-    if fallback_residue:
+    fallback_residue = [path for path in agent_markdown if path.name.endswith("-fallback.md")]
+    unsafe_fallback_residue = [
+        path for path in unsafe_inventory_paths
+        if path.suffix == ".md" and path.name.endswith("-fallback.md")
+    ]
+    if fallback_residue or unsafe_fallback_residue:
         for path in fallback_residue:
             lines.append(
-                f"DIFF UNEXPECTED_DRIFT profile={profile} agent={path.stem} "
+                f"DIFF UNEXPECTED_DRIFT profile={profile} agent={_agent_identity(agent_dir, path)} "
                 "fallback_residue=forbidden"
             )
             counts["DIFF"] += 1
+        if profile != "global":
+            for path in unsafe_fallback_residue:
+                lines.append(
+                    f"DIFF UNEXPECTED_DRIFT profile={profile} agent={_agent_identity(agent_dir, path)} "
+                    "unsafe_path=forbidden"
+                )
+                counts["DIFF"] += 1
     else:
         lines.append(f"PASS profile={profile} fallback_agents=absent")
         counts["PASS"] += 1
@@ -335,10 +384,11 @@ def _audit_profile_contract(
         if (agent_dir.parent / "local-workers.toml").is_file():
             optional_agents = set(documents["optional-workers"]["workers"]["allowed"])
         registered_agents = expected_roles | optional_agents
-        for path in sorted(agent_dir.glob("*.md")):
-            if path.stem not in registered_agents and not path.name.endswith("-fallback.md"):
+        for path in agent_markdown:
+            identity = _agent_identity(agent_dir, path)
+            if identity not in registered_agents and not path.name.endswith("-fallback.md"):
                 lines.append(
-                    f"DIFF UNEXPECTED_DRIFT profile={profile} agent={path.stem} "
+                    f"DIFF UNEXPECTED_DRIFT profile={profile} agent={identity} "
                     "unregistered_agent=forbidden"
                 )
                 counts["DIFF"] += 1
