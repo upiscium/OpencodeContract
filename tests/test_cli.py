@@ -49,7 +49,7 @@ class ConsumerAuditCliTest(unittest.TestCase):
 
     def run_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(TOOLS / "opencode_policy.py"), *arguments],
+            [sys.executable, str(TOOLS / "opencode_contract.py"), *arguments],
             cwd=ROOT,
             text=True,
             capture_output=True,

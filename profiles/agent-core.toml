@@ -11,7 +11,7 @@ invariants = [
   "A Task Orchestrator owns implementation for exactly one Task.",
   "Raw Git and GitHub writes are restricted to guarded repository APIs.",
   "Agent Core lifecycle, adoption, upgrade, VERSION, and UPSTREAM remain Templates ownership.",
-  "Project Adapter policy and implementation are not OpenCodePolicy ownership.",
+  "Project Adapter policy and implementation are not OpencodeContract ownership.",
 ]
 
 [assignments.build]

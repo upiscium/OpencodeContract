@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical OpenCodePolicy command-line interface."""
+"""Canonical OpencodeContract command-line interface."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def _audit_consumers(dotnix: Path, templates: Path, strict: bool) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="opencode-policy", description=__doc__)
+    parser = argparse.ArgumentParser(prog="opencode-contract", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("validate", help="validate the policy contract")
 

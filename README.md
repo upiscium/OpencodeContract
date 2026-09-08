@@ -1,8 +1,8 @@
-# OpenCodePolicy
+# OpencodeContract
 
-OpenCodePolicy is the machine-readable shared policy and compatibility contract for the OpenCode configurations implemented by [`upiscium/dotnix`](https://github.com/upiscium/dotnix) and [`upiscium/Templates`](https://github.com/upiscium/Templates).
+OpencodeContract is the machine-readable shared contract for canonical OpenCode roles, models, availability invariants, optional compatibility extensions, and consumer conformance for the OpenCode configurations implemented by [`upiscium/dotnix`](https://github.com/upiscium/dotnix) and [`upiscium/Templates`](https://github.com/upiscium/Templates).
 
-> **OpenCodePolicy does not own the complete OpenCode configuration.**
+> **OpencodeContract does not own the complete OpenCode configuration.**
 >
 > **It owns shared policy and compatibility contracts.**
 
@@ -10,10 +10,10 @@ OpenCodePolicy is the machine-readable shared policy and compatibility contract 
 
 ## Why this repository exists
 
-The two consumers share role names, fixed model identities, model-availability behavior, and durable safety constraints, while retaining materially different authority and lifecycle semantics. Keeping those contracts only in implementation files makes intentional differences hard to distinguish from drift. OpenCodePolicy provides one reviewable source of truth above both implementations without moving either implementation here.
+The two consumers share role names, fixed model identities, model-availability behavior, and durable safety constraints, while retaining materially different authority and lifecycle semantics. Keeping those contracts only in implementation files makes intentional differences hard to distinguish from drift. OpencodeContract provides one reviewable source of truth above both implementations without moving either implementation here.
 
 ```text
-OpenCodePolicy
+OpencodeContract
     | shared policy / compatibility contract
     +----------------------+----------------------+
     v                                             v
@@ -22,7 +22,7 @@ dotnix global profile                     Templates Agent-Core profile
 ~/.config/opencode                        repository-local Agent Core
 ```
 
-There is no dependency from OpenCodePolicy to Templates Agent Core generation or adoption. This repository must remain independently bootstrapped so that `OpenCodePolicy -> Templates -> OpenCodePolicy` cannot arise.
+There is no dependency from OpencodeContract to Templates Agent Core generation or adoption. This repository must remain independently bootstrapped so that `OpencodeContract -> Templates -> OpencodeContract` cannot arise.
 
 ## Ownership boundary
 
@@ -42,7 +42,7 @@ There is no dependency from OpenCodePolicy to Templates Agent Core generation or
 - repository policy, adoption, upgrade, `VERSION`, `UPSTREAM`, and Project Adapter;
 - complete Agent-Core prompts, commands, and skills.
 
-Neither complete prompt implementations nor command/skill implementations move here. OpenCodePolicy does not generate, materialize, synchronize, or modify either consumer.
+Neither complete prompt implementations nor command/skill implementations move here. OpencodeContract does not generate, materialize, synchronize, or modify either consumer.
 
 ## Profiles
 
@@ -84,13 +84,13 @@ The parent validates paths, lines or ranges, snippets, mechanism, confidence, an
 
 OpenCode v1.18.16 does not expose its internal `toolChoice: required` control through the public plugin API. Required-tool selection, one-retry accounting, evidence validation, and single-in-flight dispatch are therefore procedural parent controls in Phase 1—not runtime guarantees. A strict audit validates declarations and static configuration only; it does not prove runtime behavior, model availability, or output correctness.
 
-When a Global extension manifest is present beside the selected profile-owned `opencode.json` and `agents/` directory, strict audit validates the complete bundle: exact worker classes, provider/model resolution, sticky bindings, fail-closed retry declarations, metrics schema, hidden subagent metadata, and exact permissions. The selected agent directory is a closed inventory, so unregistered files—including disguised fallback agents—and partial extension deployment fail strict audit. Repository-local OpenCode layers outside that selected Global bundle remain separately authoritative and are not searched or reclassified. This envelope is tracked by [Issue #5](https://github.com/upiscium/OpenCodePolicy/issues/5).
+When a Global extension manifest is present beside the selected profile-owned `opencode.json` and `agents/` directory, strict audit validates the complete bundle: exact worker classes, provider/model resolution, sticky bindings, fail-closed retry declarations, metrics schema, hidden subagent metadata, and exact permissions. The selected agent directory is a closed inventory, so unregistered files—including disguised fallback agents—and partial extension deployment fail strict audit. Repository-local OpenCode layers outside that selected Global bundle remain separately authoritative and are not searched or reclassified. This envelope is tracked by [Issue #5](https://github.com/upiscium/OpencodeContract/issues/5).
 
 ## Model availability
 
 Each applicable role has one fixed configured model. Model substitution and alternate-model retry are forbidden, including for quota, rate-limit, usage-limit, or availability failures. No hidden or manually callable model-substitution fallback agent is permitted.
 
-When the configured provider/model cannot execute the bounded objective, the result is `BLOCKED` and the exact provider/model failure is reported. OpenCodePolicy guarantees policy consistency, not provider or model availability. Quality-preserving execution under this policy requires the configured GPT-5.6 role model.
+When the configured provider/model cannot execute the bounded objective, the result is `BLOCKED` and the exact provider/model failure is reported. OpencodeContract guarantees policy consistency, not provider or model availability. Quality-preserving execution under this policy requires the configured GPT-5.6 role model.
 
 ## Intentionally not canonical
 
@@ -103,7 +103,7 @@ Python 3.11 or newer is required for standard-library `tomllib`.
 ```sh
 python tools/validate_policy.py
 python -m unittest discover -s tests -v
-opencode-policy validate
+opencode-contract validate
 ```
 
 The validator parses all TOML documents and checks semantic ID uniqueness, model/role/profile references, required fields, model ID syntax, applicability consistency, complete single-model assignments, intentional differences, and the fixed model-availability contract.
@@ -113,12 +113,12 @@ The validator parses all TOML documents and checks semantic ID uniqueness, model
 The canonical CLI audits one explicitly selected profile without requiring the other consumer:
 
 ```sh
-opencode-policy audit-consumer \
+opencode-contract audit-consumer \
   --profile global \
   --consumer /path/to/dotnix \
   --strict
 
-opencode-policy audit-consumer \
+opencode-contract audit-consumer \
   --profile agent-core \
   --consumer /path/to/Templates \
   --strict
@@ -144,15 +144,15 @@ Consumer repositories are intentionally not cloned by CI. Policy CI therefore re
 
 The flake supports `x86_64-linux` and `aarch64-linux` and exposes:
 
-- `packages.<system>.default` and `packages.<system>.opencode-policy`;
-- `apps.<system>.default` for the canonical `opencode-policy <subcommand>` interface;
+- `packages.<system>.default` and `packages.<system>.opencode-contract`;
+- `apps.<system>.default` for the canonical `opencode-contract <subcommand>` interface;
 - `checks.<system>.policy`, `checks.<system>.audit-consumer`, and `checks.<system>.tests`;
 - `devShells.<system>.default` with Python 3.
 
 Examples:
 
 ```sh
-nix build .#opencode-policy
+nix build .#opencode-contract
 nix run .# -- validate
 nix flake check
 nix develop
@@ -165,21 +165,21 @@ The package contains only Python, policy/profile documents, and the standard-lib
 Future consumers can pin this repository as a normal flake input:
 
 ```nix
-inputs.opencodePolicy.url = "github:upiscium/OpenCodePolicy";
-inputs.opencodePolicy.inputs.nixpkgs.follows = "nixpkgs";
+inputs.opencodeContract.url = "github:upiscium/OpencodeContract";
+inputs.opencodeContract.inputs.nixpkgs.follows = "nixpkgs";
 ```
 
-The consumer's `flake.lock` owns the exact OpenCodePolicy Git revision. The consumer check invocation separately owns the explicit profile selection: Templates uses `--profile agent-core`, while dotnix uses `--profile global`. Profiles are not stored in `flake.lock`.
+The consumer's `flake.lock` owns the exact OpencodeContract Git revision. The consumer check invocation separately owns the explicit profile selection: Templates uses `--profile agent-core`, while dotnix uses `--profile global`. Profiles are not stored in `flake.lock`.
 
 The locked Git revision is dependency identity. It is separate from `schema_version = 1`, which continues to identify the machine-readable policy document schema.
 
 Consumer updates are deliberate dependency updates, for example:
 
 ```sh
-nix flake update opencodePolicy
+nix flake update opencodeContract
 ```
 
-Consumers do not follow OpenCodePolicy `main` at audit runtime. OpenCodePolicy has no input or runtime dependency on Templates or dotnix, preserving the one-way dependency direction.
+Consumers do not follow OpencodeContract `main` at audit runtime. OpencodeContract has no input or runtime dependency on Templates or dotnix, preserving the one-way dependency direction.
 
 ## Current consumers
 
@@ -190,6 +190,6 @@ Consumers do not follow OpenCodePolicy `main` at audit runtime. OpenCodePolicy h
 
 ## Consumer transitions
 
-Consumers advance this contract only by explicitly updating their pinned OpenCodePolicy revision. A consumer may therefore remain conformant to an older locked policy while its implementation migration is pending; movement of OpenCodePolicy `main` alone does not change that consumer's audit dependency.
+Consumers advance this contract only by explicitly updating their pinned OpencodeContract revision. A consumer may therefore remain conformant to an older locked policy while its implementation migration is pending; movement of OpencodeContract `main` alone does not change that consumer's audit dependency.
 
-Profile migrations must preserve implementation ownership, avoid runtime network dependencies, and prevent dependency cycles. OpenCodePolicy does not generate or materialize consumer configuration.
+Profile migrations must preserve implementation ownership, avoid runtime network dependencies, and prevent dependency cycles. OpencodeContract does not generate or materialize consumer configuration.
