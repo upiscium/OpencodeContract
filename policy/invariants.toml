@@ -3,7 +3,7 @@ schema_version = 1
 [[invariants]]
 id = "policy-not-implementation"
 scope = "common"
-statement = "OpenCodePolicy owns shared policy and compatibility contracts, not complete OpenCode configuration implementations."
+statement = "OpencodeContract owns shared policy and compatibility contracts, not complete OpenCode configuration implementations."
 
 [[invariants]]
 id = "consumer-implementation-ownership"
