@@ -366,7 +366,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
         with tempfile.TemporaryDirectory() as temporary:
             consumer = self.make_consumer(Path(temporary), "global")
             plan = consumer / "config.d/opencode/agents/plan.md"
-            plan.write_text(plan.read_text().replace("openai/gpt-5.6-sol", "openai/wrong"), encoding="utf-8")
+            plan.write_text(plan.read_text().replace("openai/gpt-5.6-luna", "openai/wrong"), encoding="utf-8")
             lines, counts = audit_profile("global", consumer, self.documents)
             self.assertEqual(1, counts["DIFF"])
             self.assertTrue(any("role=plan primary_model" in line for line in lines))
