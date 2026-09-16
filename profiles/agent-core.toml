@@ -19,7 +19,7 @@ primary_model = "sol"
 authority = "main-orchestrator-no-direct-implementation"
 
 [assignments.plan]
-primary_model = "sol"
+primary_model = "luna"
 authority = "repository-read-only-planner"
 
 [assignments.architect]
@@ -43,11 +43,11 @@ primary_model = "luna"
 authority = "depth-2-read-only-verification"
 
 [assignments.reviewer]
-primary_model = "terra"
+primary_model = "luna"
 authority = "depth-2-read-only-review"
 
 [assignments.investigator]
-primary_model = "terra"
+primary_model = "luna"
 authority = "depth-2-read-only-investigation"
 
 [assignments.security-reviewer]
