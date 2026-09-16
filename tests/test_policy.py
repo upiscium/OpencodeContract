@@ -169,13 +169,13 @@ class PolicyContractTests(unittest.TestCase):
     def test_current_common_primary_assignments(self) -> None:
         expected = {
             "build": ("sol", "sol"),
-            "plan": ("sol", "sol"),
+            "plan": ("luna", "luna"),
             "architect": ("sol", "sol"),
             "general": ("luna", "luna"),
             "explore": ("luna", "luna"),
             "verifier": ("luna", "luna"),
-            "reviewer": ("terra", "terra"),
-            "investigator": ("terra", "terra"),
+            "reviewer": ("luna", "luna"),
+            "investigator": ("luna", "luna"),
             "security-reviewer": ("terra", "terra"),
             "scout": ("luna", "luna"),
             "task-orchestrator": ("sol", "sol"),
@@ -235,7 +235,7 @@ class PolicyContractTests(unittest.TestCase):
             dotnix, templates, _, _ = self.make_consumer_fixture(Path(temporary))
             plan_path = dotnix / "config.d/opencode/agents/plan.md"
             plan_path.write_text(
-                plan_path.read_text(encoding="utf-8").replace("openai/gpt-5.6-sol", "openai/wrong"),
+                plan_path.read_text(encoding="utf-8").replace("openai/gpt-5.6-luna", "openai/wrong"),
                 encoding="utf-8",
             )
             lines, counts = audit(dotnix, templates, ROOT)
