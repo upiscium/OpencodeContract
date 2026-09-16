@@ -178,7 +178,7 @@ class PolicyContractTests(unittest.TestCase):
             "investigator": ("luna", "luna"),
             "security-reviewer": ("terra", "terra"),
             "scout": ("luna", "luna"),
-            "task-orchestrator": ("sol", "sol"),
+            "task-orchestrator": ("sol", "luna"),
         }
         for role, (global_model, agent_core_model) in expected.items():
             if role in self.docs["global"]["assignments"]:
