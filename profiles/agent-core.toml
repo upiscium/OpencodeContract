@@ -27,7 +27,7 @@ primary_model = "sol"
 authority = "read-only-specialist"
 
 [assignments.task-orchestrator]
-primary_model = "sol"
+primary_model = "luna"
 authority = "single-task-implementation-owner"
 
 [assignments.general]
