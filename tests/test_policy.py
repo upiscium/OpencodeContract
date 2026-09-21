@@ -40,6 +40,306 @@ class PolicyContractTests(unittest.TestCase):
     def test_policy_is_valid(self) -> None:
         self.assertEqual([], validate_policy(ROOT))
 
+    def copy_policy_fixture(self, root: Path) -> Path:
+        shutil.copytree(ROOT / "policy", root / "policy")
+        shutil.copytree(ROOT / "profiles", root / "profiles")
+        return root / "policy/permission-semantics.toml"
+
+    def assert_permission_semantics_error(self, errors: list[str], *terms: str) -> None:
+        relevant = [error for error in errors if "policy/permission-semantics" in error]
+        self.assertTrue(relevant, errors)
+        rendered = "\n".join(relevant)
+        for term in terms:
+            self.assertIn(term, rendered)
+
+    def test_permission_semantics_has_exact_six_classes_and_matrices(self) -> None:
+        document = self.docs["permission-semantics"]
+        contract = document["contract"]
+        expected_classes = [
+            "safe-read-only",
+            "local-filesystem-delete",
+            "repository-history-destruction",
+            "remote-destructive-operation",
+            "privilege-escalation",
+            "system-store-destruction",
+        ]
+        self.assertEqual(expected_classes, contract["operation_classes"])
+        self.assertTrue(contract["allow_requires_configured_role_permission"])
+
+        classes = document["operation_classes"]
+        self.assertEqual(6, len(classes))
+        self.assertEqual(expected_classes, [operation["id"] for operation in classes])
+        expected_matrix = {
+            "safe-read-only": ("allow", "allow", "none", "none"),
+            "local-filesystem-delete": ("ask", "deny", "none", "NEEDS_APPROVAL"),
+            "repository-history-destruction": ("deny", "deny", "BLOCKED", "BLOCKED"),
+            "remote-destructive-operation": ("deny", "deny", "BLOCKED", "BLOCKED"),
+            "privilege-escalation": ("deny", "deny", "BLOCKED", "BLOCKED"),
+            "system-store-destruction": ("deny", "deny", "BLOCKED", "BLOCKED"),
+        }
+        actual_matrix = {
+            operation["id"]: (
+                operation["parent_disposition"],
+                operation["leaf_disposition"],
+                operation["parent_escalation"],
+                operation["leaf_escalation"],
+            )
+            for operation in classes
+        }
+        self.assertEqual(expected_matrix, actual_matrix)
+
+    def test_local_filesystem_delete_requires_parent_approval(self) -> None:
+        operation = {
+            item["id"]: item for item in self.docs["permission-semantics"]["operation_classes"]
+        }["local-filesystem-delete"]
+        self.assertEqual("ask", operation["parent_disposition"])
+        self.assertEqual("deny", operation["leaf_disposition"])
+        self.assertEqual("NEEDS_APPROVAL", operation["leaf_escalation"])
+        self.assertEqual("none", operation["parent_escalation"])
+        self.assertTrue(operation["exact_target_required"])
+
+    def test_structural_history_remote_privilege_and_system_operations_are_denied(self) -> None:
+        operations = {
+            item["id"]: item for item in self.docs["permission-semantics"]["operation_classes"]
+        }
+        structural = (
+            "repository-history-destruction",
+            "remote-destructive-operation",
+            "system-store-destruction",
+        )
+        for operation_id in structural:
+            with self.subTest(operation=operation_id):
+                operation = operations[operation_id]
+                self.assertTrue(operation["structural"])
+                self.assertEqual("deny", operation["parent_disposition"])
+                self.assertEqual("deny", operation["leaf_disposition"])
+                self.assertEqual("BLOCKED", operation["parent_escalation"])
+                self.assertEqual("BLOCKED", operation["leaf_escalation"])
+
+        privilege = operations["privilege-escalation"]
+        self.assertEqual("deny", privilege["parent_disposition"])
+        self.assertEqual("deny", privilege["leaf_disposition"])
+        self.assertEqual("BLOCKED", privilege["parent_escalation"])
+        self.assertEqual("BLOCKED", privilege["leaf_escalation"])
+        self.assertTrue(privilege["permission_mutation"])
+
+    def test_needs_approval_has_minimum_evidence_and_fail_closed_invariants(self) -> None:
+        signal = self.docs["permission-semantics"]["signals"]["NEEDS_APPROVAL"]
+        self.assertEqual("permission-escalation", signal["kind"])
+        self.assertEqual("approval-capable-parent", signal["interactive_boundary"])
+        self.assertFalse(signal["terminal"])
+        self.assertFalse(signal["leaf_direct_ask"])
+        self.assertFalse(signal["leaf_direct_execution"])
+        self.assertFalse(signal["leaf_permission_mutation"])
+        self.assertFalse(signal["permission_bypass"])
+        self.assertTrue(signal["parent_independent_reevaluation"])
+        self.assertFalse(signal["parent_relay"])
+        self.assertFalse(signal["parent_auto_approve"])
+        self.assertFalse(signal["leaf_executes_denied_operation"])
+        self.assertEqual("BLOCKED", signal["out_of_authority"])
+        self.assertEqual(
+            {"retry", "rephrase", "redelegation", "equivalent-substitute"},
+            set(signal["rejection_bypass_methods_forbidden"]),
+        )
+        self.assertTrue(
+            {
+                "operation_class",
+                "operation_identity",
+                "scope",
+                "purpose",
+                "evidence",
+                "least_privilege",
+                "safe_alternatives",
+                "configured_authority",
+            }.issubset(signal["required_evidence"])
+        )
+
+    def test_needs_decision_is_not_a_permission_approval_path(self) -> None:
+        signals = self.docs["permission-semantics"]["signals"]
+        approval = signals["NEEDS_APPROVAL"]
+        decision = signals["NEEDS_DECISION"]
+        self.assertEqual("requirements-product-or-architecture-ambiguity", decision["kind"])
+        self.assertEqual("only-when-human-judgment-required", decision["interactive_boundary"])
+        self.assertFalse(decision["terminal"])
+        self.assertFalse(decision["permission_approval_resolves"])
+        self.assertTrue(decision["parent_must_resolve_from_contract_or_evidence"])
+        self.assertFalse(decision["leaf_direct_ask"])
+        self.assertEqual("not-an-approval-path", decision["permission_denial_resolution"])
+        self.assertNotEqual(approval["kind"], decision["kind"])
+        self.assertNotEqual(approval["interactive_boundary"], decision["interactive_boundary"])
+        self.assertTrue(
+            {
+                "ambiguity",
+                "known_evidence",
+                "requirements_or_product_or_architecture",
+                "options",
+                "recommendation",
+            }.issubset(decision["required_evidence"])
+        )
+
+    def test_permission_semantics_rejects_unknown_semantic_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            contents = path.read_text(encoding="utf-8").replace(
+                '  "safe-read-only",',
+                '  "unknown-semantic-operation",',
+                1,
+            )
+            path.write_text(contents, encoding="utf-8")
+            self.assert_permission_semantics_error(
+                validate_policy(root), "unknown-semantic-operation", "operation"
+            )
+
+    def test_permission_semantics_rejects_unknown_disposition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            contents = path.read_text(encoding="utf-8").replace(
+                'id = "local-filesystem-delete"\nparent_disposition = "ask"',
+                'id = "local-filesystem-delete"\nparent_disposition = "prompt"',
+                1,
+            )
+            path.write_text(contents, encoding="utf-8")
+            self.assert_permission_semantics_error(
+                validate_policy(root), "local-filesystem-delete", "disposition"
+            )
+
+    def test_permission_semantics_rejects_missing_required_operation_class(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            contents = path.read_text(encoding="utf-8")
+            start = contents.index('\n[[operation_classes]]\nid = "system-store-destruction"')
+            end = contents.index("\n[signals.NEEDS_APPROVAL]", start)
+            path.write_text(contents[:start] + contents[end:], encoding="utf-8")
+            self.assert_permission_semantics_error(
+                validate_policy(root), "system-store-destruction", "operation"
+            )
+
+    def test_permission_semantics_rejects_malformed_profile_and_authority_references(self) -> None:
+        variants = (
+            ('profile = "global"', 'profile = "unknown-profile"', "unknown-profile", "profile"),
+            (
+                'parent_authority = "approval-capable-parent"',
+                'parent_authority = "unknown-authority"',
+                "unknown-authority",
+                "authority",
+            ),
+        )
+        for old, new, reference, field in variants:
+            with self.subTest(reference=reference):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    path = self.copy_policy_fixture(root)
+                    contents = path.read_text(encoding="utf-8").replace(old, new, 1)
+                    path.write_text(contents, encoding="utf-8")
+                    self.assert_permission_semantics_error(
+                        validate_policy(root), reference, field
+                    )
+
+    def test_permission_semantics_rejects_contradictory_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            contents = path.read_text(encoding="utf-8").replace(
+                'id = "safe-read-only"\n'
+                'parent_disposition = "allow"\n'
+                'leaf_disposition = "allow"\n'
+                'parent_escalation = "none"',
+                'id = "safe-read-only"\n'
+                'parent_disposition = "allow"\n'
+                'leaf_disposition = "allow"\n'
+                'parent_escalation = "NEEDS_APPROVAL"',
+                1,
+            )
+            path.write_text(contents, encoding="utf-8")
+            self.assert_permission_semantics_error(
+                validate_policy(root), "safe-read-only", "parent_escalation"
+            )
+
+    def test_permission_semantics_rejects_undeclared_schema_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            contents = path.read_text(encoding="utf-8").replace(
+                "closed_world = true\n",
+                "closed_world = true\nundeclared_extension = true\n",
+                1,
+            )
+            path.write_text(contents, encoding="utf-8")
+            self.assert_permission_semantics_error(
+                validate_policy(root), "undeclared_extension", "contract"
+            )
+
+    def test_permission_semantics_rejects_unknown_top_level_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            path.write_text(
+                path.read_text(encoding="utf-8")
+                + "\n[unexpected]\nenabled = true\n",
+                encoding="utf-8",
+            )
+            self.assert_permission_semantics_error(
+                validate_policy(root), "unexpected", "unknown fields"
+            )
+
+    def test_permission_semantics_rejects_invalid_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "schema_version = 1", "schema_version = 2", 1
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "policy/permission-semantics.toml: schema_version must be 1",
+                validate_policy(root),
+            )
+
+    def test_permission_semantics_rejects_local_delete_silent_allow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            contents = path.read_text(encoding="utf-8").replace(
+                'id = "local-filesystem-delete"\n'
+                'parent_disposition = "ask"\n'
+                'leaf_disposition = "deny"',
+                'id = "local-filesystem-delete"\n'
+                'parent_disposition = "ask"\n'
+                'leaf_disposition = "allow"',
+                1,
+            )
+            path.write_text(contents, encoding="utf-8")
+            self.assert_permission_semantics_error(
+                validate_policy(root), "local-filesystem-delete", "leaf_disposition"
+            )
+
+    def test_permission_semantics_rejects_structural_destruction_ask_or_allow(self) -> None:
+        class_header = (
+            'id = "repository-history-destruction"\n'
+            'parent_disposition = "deny"\n'
+            'leaf_disposition = "deny"'
+        )
+        for field in ("parent_disposition", "leaf_disposition"):
+            for value in ("ask", "allow"):
+                with self.subTest(field=field, value=value):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        path = self.copy_policy_fixture(root)
+                        contents = path.read_text(encoding="utf-8")
+                        replacement = class_header.replace(
+                            f'{field} = "deny"', f'{field} = "{value}"', 1
+                        )
+                        self.assertNotEqual(class_header, replacement)
+                        path.write_text(contents.replace(class_header, replacement, 1), encoding="utf-8")
+                        self.assert_permission_semantics_error(
+                            validate_policy(root), "repository-history-destruction", field
+                        )
+
     def test_optional_workers_are_global_noncanonical_and_procedural(self) -> None:
         optional = self.docs["optional-workers"]
         contract = optional["contract"]

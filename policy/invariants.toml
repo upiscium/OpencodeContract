@@ -50,6 +50,56 @@ id = "consumer-audit-read-only"
 scope = "common"
 statement = "Consumer auditing observes dotnix and Templates without modifying either repository."
 
+[[invariants]]
+id = "bounded-safety-semantics-canonical"
+scope = "common"
+statement = "OpencodeContract canonically defines bounded cross-consumer permission safety semantics while complete permission maps remain intentionally consumer-owned and noncanonical."
+
+[[invariants]]
+id = "permission-map-implementation-owned"
+scope = "common"
+statement = "Consumers own complete permission maps, OpenCode glob and pattern spelling, prompt wording, guarded APIs, Task lifecycle, and provider, UI, and machine details."
+
+[[invariants]]
+id = "leaf-no-direct-ask-execution-permission-mutation"
+scope = "common"
+statement = "A non-interactive leaf never directly issues Ask, executes a denied or approval-required operation, or mutates permissions."
+
+[[invariants]]
+id = "no-permission-bypass"
+scope = "common"
+statement = "No parent or leaf bypasses a required allow, ask, deny, authority, or escalation decision."
+
+[[invariants]]
+id = "parent-independent-reevaluation-no-relay"
+scope = "common"
+statement = "The approval-capable parent independently reevaluates every leaf escalation request, never auto-approves it, and the leaf returns an outcome rather than relaying an Ask."
+
+[[invariants]]
+id = "out-of-authority-blocked"
+scope = "common"
+statement = "An operation outside the configured authority, including an unknown class, profile, or authority, returns BLOCKED."
+
+[[invariants]]
+id = "user-rejection-exact-operation-final"
+scope = "common"
+statement = "A user's rejection is final for the exact operation within the task; retry, rephrase, redelegation, and an equivalent substitute cannot bypass it."
+
+[[invariants]]
+id = "needs-approval-minimum"
+scope = "common"
+statement = "NEEDS_APPROVAL is the minimum non-terminal outcome for a bounded approval-required operation; it grants no execution authority and returns to an approval-capable parent."
+
+[[invariants]]
+id = "needs-decision-not-approval"
+scope = "common"
+statement = "NEEDS_DECISION is reserved for unresolved requirements, product, or architecture ambiguity requiring human judgment; it is not a permission approval path and must be resolved by the parent from contract or evidence."
+
+[[invariants]]
+id = "canonical-policy-no-shell-literals"
+scope = "common"
+statement = "Canonical policy contains semantic class identifiers and outcomes, not shell command literals; consumers own OpenCode pattern spelling and guarded API details."
+
 [[intentional_differences]]
 id = "build-authority"
 role = "build"
