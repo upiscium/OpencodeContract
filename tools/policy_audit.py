@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import tomllib
 from typing import Any, Mapping
 
@@ -24,19 +27,85 @@ LOCAL_MANIFEST_KEYS = {
     "max_in_flight", "required_tools", "retry_limit", "retry_eligibility",
     "retry_exclusions", "retry_model_policy", "fallback", "workers", "metrics",
 }
+PERMISSION_MANIFEST_NAME = "opencode-contract-permissions.toml"
+PERMISSION_MANIFEST_KEYS = {
+    "schema_version", "contract", "profile", "surfaces", "probes",
+}
+PERMISSION_SURFACE_KEYS = {"id", "boundary", "source_kind", "sources"}
+PERMISSION_PROBE_KEYS = {"surface", "tool", "input", "classes"}
+PERMISSION_BOUNDARIES = {"parent", "leaf"}
+PERMISSION_SOURCE_KINDS = {"json", "agent-frontmatter"}
+PERMISSION_ACTIONS = {"allow", "ask", "deny"}
+_PERMISSION_MISSING = object()
 
 
-def parse_frontmatter(path: Path) -> dict[str, Any]:
+def _secure_read_file(
+    path: Path,
+    consumer_root: Path,
+) -> tuple[bytes | None, str, str | None]:
+    """Read a regular consumer file without following path-component symlinks."""
+    try:
+        relative = path.relative_to(consumer_root)
+    except ValueError:
+        return None, "error", "path_not_confined"
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None:
+        return None, "error", "secure_open_unavailable"
+
+    common_flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    directory_flags = common_flags | directory_flag
+    directory_fd = -1
+    file_fd = -1
+    try:
+        directory_fd = os.open(os.fspath(consumer_root), directory_flags)
+        parts = relative.parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            return None, "error", "path_not_confined"
+        for component in parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            parts[-1],
+            common_flags | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory_fd,
+        )
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            return None, "error", "not_regular"
+        with os.fdopen(file_fd, "rb") as handle:
+            file_fd = -1
+            return handle.read(), "ok", None
+    except FileNotFoundError:
+        return None, "missing", "file_missing"
+    except NotADirectoryError:
+        return None, "error", "path_not_directory"
+    except OSError as exc:
+        return None, "error", f"secure_open_error={exc}"
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def parse_frontmatter(path: Path, consumer_root: Path) -> dict[str, Any]:
     """Parse the scalar fields needed by the audit without a YAML dependency."""
     result: dict[str, Any] = {}
+    content, status, _reason = _secure_read_file(path, consumer_root)
+    if status != "ok" or content is None:
+        return result
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
         return result
     if not lines or lines[0].strip() != "---":
         return result
+    closed = False
     for line in lines[1:]:
         if line.strip() == "---":
+            closed = True
             break
         if line.startswith((" ", "\t")) or ":" not in line:
             continue
@@ -46,39 +115,188 @@ def parse_frontmatter(path: Path) -> dict[str, Any]:
             result[key] = value == "true"
         else:
             result[key] = value
-    return result
+    return result if closed else {}
 
 
-def _frontmatter_permissions(path: Path) -> dict[str, str]:
-    """Parse one scalar indentation level under a frontmatter permission map."""
+def _frontmatter_permissions(path: Path, consumer_root: Path) -> dict[str, str]:
+    """Parse the flat permission map used by the optional-worker contract."""
+    content, status, _reason = _secure_read_file(path, consumer_root)
+    if status != "ok" or content is None:
+        return {}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
         return {}
-    if not lines or lines[0].strip() != "---":
+    try:
+        document = _parse_bounded_frontmatter(text)
+    except ValueError:
         return {}
-    permissions: dict[str, str] = {}
-    in_permissions = False
-    for line in lines[1:]:
-        if line.strip() == "---":
-            break
-        if line == "permission:":
-            in_permissions = True
+    permissions = document.get("permission")
+    if not isinstance(permissions, Mapping):
+        return {}
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in permissions.items()):
+        return {}
+    return dict(permissions)
+
+
+def _frontmatter_commentless_value(value: str) -> str:
+    """Remove a simple YAML-style comment without treating # in quotes specially."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, character in enumerate(value):
+        if in_double and escaped:
+            escaped = False
             continue
-        if in_permissions and line and not line[0].isspace():
+        if in_double and character == "\\":
+            escaped = True
+            continue
+        if character == "'" and not in_double:
+            in_single = not in_single
+        elif character == '"' and not in_single:
+            in_double = not in_double
+        elif character == "#" and not in_single and not in_double:
+            if index == 0 or value[index - 1].isspace():
+                return value[:index].rstrip()
+    return value.strip()
+
+
+def _frontmatter_token(value: str) -> Any:
+    """Parse the bounded scalar subset needed by permission frontmatter."""
+    value = _frontmatter_commentless_value(value)
+    if not value:
+        return ""
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid double-quoted scalar: {exc}") from exc
+        if not isinstance(decoded, str):
+            raise ValueError("quoted frontmatter key or value is not a string")
+        return decoded
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value in {"null", "~"}:
+        return None
+    try:
+        if value.isdigit() or (
+            value.startswith(("+", "-")) and value[1:].isdigit()
+        ):
+            return int(value)
+        if any(character in value for character in ".eE"):
+            return float(value)
+    except ValueError:
+        pass
+    return value
+
+
+def _frontmatter_mapping_separator(line: str) -> int:
+    """Find a mapping colon while leaving quoted pattern keys intact."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, character in enumerate(line):
+        if in_double and escaped:
+            escaped = False
+            continue
+        if in_double and character == "\\":
+            escaped = True
+            continue
+        if character == "'" and not in_double:
+            in_single = not in_single
+        elif character == '"' and not in_single:
+            in_double = not in_double
+        elif character == ":" and not in_single and not in_double:
+            return index
+    return -1
+
+
+def _parse_bounded_frontmatter(text: str) -> dict[str, Any]:
+    """Parse frontmatter mappings without depending on a generic YAML parser."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("missing frontmatter opening delimiter")
+
+    closing_index: int | None = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            closing_index = index
             break
-        if in_permissions and line.startswith("  ") and ":" in line:
-            key, value = line.strip().split(":", 1)
-            permissions[key.strip('"\'')] = value.strip().strip('"\'')
-    return permissions
+    if closing_index is None:
+        raise ValueError("missing frontmatter closing delimiter")
+
+    result: dict[str, Any] = {}
+    # Each stack item represents a mapping opened by a key with no scalar
+    # value.  Keeping the indentation and insertion order is sufficient for
+    # the bounded permission syntax and preserves ordered pattern rules.
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, result)]
+    previous_indent = -1
+    previous_opened_mapping = True
+    saw_content = False
+
+    for line_number, line in enumerate(lines[1:closing_index], start=2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        leading = line[: len(line) - len(line.lstrip(" "))]
+        if "\t" in leading:
+            raise ValueError(f"tabs are not supported at line {line_number}")
+        indent = len(leading)
+        if not saw_content and indent != 0:
+            raise ValueError(f"nested first key at line {line_number}")
+        if (
+            saw_content
+            and indent > previous_indent
+            and not previous_opened_mapping
+        ):
+            raise ValueError(f"unexpected indentation at line {line_number}")
+
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if not stack:
+            raise ValueError(f"invalid indentation at line {line_number}")
+
+        separator = _frontmatter_mapping_separator(line)
+        if separator < 0:
+            raise ValueError(f"expected mapping entry at line {line_number}")
+        raw_key = line[:separator]
+        raw_value = line[separator + 1 :]
+        key_value = _frontmatter_token(raw_key.strip())
+        if not isinstance(key_value, str) or not key_value:
+            raise ValueError(f"invalid mapping key at line {line_number}")
+        parent = stack[-1][1]
+        if key_value in parent:
+            raise ValueError(f"duplicate mapping key {key_value!r} at line {line_number}")
+
+        value = _frontmatter_commentless_value(raw_value.strip())
+        if not value:
+            child: dict[str, Any] = {}
+            parent[key_value] = child
+            stack.append((indent, child))
+            previous_opened_mapping = True
+        else:
+            parent[key_value] = _frontmatter_token(value)
+            previous_opened_mapping = False
+        previous_indent = indent
+        saw_content = True
+
+    return result
 
 
 def _profile_agent_dir(profile: str, consumer_root: Path) -> Path:
     candidates = [consumer_root / relative for relative in PROFILE_AGENT_DIRS[profile]]
-    return next(
-        (candidate for candidate in candidates if candidate.exists() or candidate.is_symlink()),
-        candidates[0],
-    )
+    for candidate in candidates:
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+        # A partially deployed preferred bundle must not silently fall back to
+        # an older bundle merely because its agents directory is absent.
+        bundle_dir = candidate.parent if profile == "global" else candidate.parent.parent
+        if bundle_dir.exists() or bundle_dir.is_symlink():
+            return candidate
+    return candidates[0]
 
 
 def _is_confined_path(path: Path, consumer_root: Path) -> bool:
@@ -129,6 +347,835 @@ def _string_list(value: Any) -> list[str] | None:
     return value
 
 
+def _permission_bundle_dir(profile: str, agent_dir: Path) -> Path:
+    """Return the selected consumer-owned bundle containing its manifest."""
+    if profile == "global":
+        return agent_dir.parent
+    return agent_dir.parent.parent
+
+
+def _permission_wildcard_match(pattern: str, value: str) -> bool:
+    """Match only OpenCode's literal, * and ? wildcard syntax."""
+    pattern_index = 0
+    value_index = 0
+    last_star = -1
+    star_value_index = 0
+
+    # Greedy star backtracking is equivalent to the bounded recursive matcher
+    # for this two-wildcard language, but cannot exhaust Python's call stack on
+    # a long valid probe input.
+    while value_index < len(value):
+        if pattern_index < len(pattern) and (
+            pattern[pattern_index] == "?"
+            or pattern[pattern_index] == value[value_index]
+        ):
+            pattern_index += 1
+            value_index += 1
+        elif pattern_index < len(pattern) and pattern[pattern_index] == "*":
+            last_star = pattern_index
+            star_value_index = value_index
+            pattern_index += 1
+        elif last_star >= 0:
+            pattern_index = last_star + 1
+            star_value_index += 1
+            value_index = star_value_index
+        else:
+            return False
+
+    while pattern_index < len(pattern) and pattern[pattern_index] == "*":
+        pattern_index += 1
+    return pattern_index == len(pattern)
+
+
+def _permission_resolution_order(
+    value: Any,
+    allowed: list[str],
+    location: str,
+    errors: list[str],
+) -> dict[str, int]:
+    """Turn the canonical fail-closed overlap declaration into ranks."""
+    if not isinstance(value, str):
+        errors.append(f"{location}: missing overlap resolution")
+        return {}
+    parts = value.split("-over-")
+    if len(parts) != len(allowed) or set(parts) != set(allowed):
+        errors.append(f"{location}: invalid overlap resolution {value!r}")
+        return {}
+    # The first item in the policy resolution string is the strongest.
+    return {item: len(parts) - index for index, item in enumerate(parts)}
+
+
+def _permission_contract_context(
+    profile: str,
+    documents: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Resolve canonical classes and the selected profile's boundary binding."""
+    errors: list[str] = []
+    document = documents.get("permission-semantics")
+    if not isinstance(document, Mapping):
+        return None, ["permission-semantics document is missing"]
+    contract = document.get("contract")
+    if not isinstance(contract, Mapping):
+        return None, ["permission-semantics contract is not a table"]
+
+    profiles = contract.get("profiles")
+    if not isinstance(profiles, list) or profile not in profiles:
+        errors.append(f"unknown profile {profile!r} in canonical permission contract")
+
+    class_values = contract.get("operation_classes")
+    class_ids: list[str] = []
+    if not isinstance(class_values, list):
+        errors.append("canonical operation_classes is not a list")
+    else:
+        for class_id in class_values:
+            if not isinstance(class_id, str) or not class_id:
+                errors.append(f"invalid canonical operation class {class_id!r}")
+            elif class_id in class_ids:
+                errors.append(f"duplicate canonical operation class {class_id!r}")
+            else:
+                class_ids.append(class_id)
+
+    dispositions = contract.get("dispositions")
+    if not isinstance(dispositions, list) or not all(
+        isinstance(item, str) and item for item in dispositions
+    ):
+        errors.append("canonical dispositions are invalid")
+        disposition_values: list[str] = []
+    else:
+        disposition_values = list(dispositions)
+    escalations = contract.get("escalation_outcomes")
+    if not isinstance(escalations, list) or not all(
+        isinstance(item, str) and item for item in escalations
+    ):
+        errors.append("canonical escalation_outcomes are invalid")
+        escalation_values: list[str] = []
+    else:
+        escalation_values = list(escalations)
+
+    operations_value = document.get("operation_classes")
+    operations: dict[str, Mapping[str, Any]] = {}
+    if not isinstance(operations_value, list):
+        errors.append("canonical operation class definitions are not a list")
+    else:
+        for operation in operations_value:
+            if not isinstance(operation, Mapping):
+                errors.append("canonical operation class definition is not a table")
+                continue
+            operation_id = operation.get("id")
+            if isinstance(operation_id, str) and operation_id:
+                if operation_id in operations:
+                    errors.append(f"duplicate canonical operation definition {operation_id!r}")
+                else:
+                    operations[operation_id] = operation
+
+    for class_id in class_ids:
+        operation = operations.get(class_id)
+        if operation is None:
+            errors.append(f"missing canonical operation definition {class_id!r}")
+            continue
+        for boundary in PERMISSION_BOUNDARIES:
+            disposition = operation.get(f"{boundary}_disposition")
+            escalation = operation.get(f"{boundary}_escalation")
+            if disposition not in disposition_values:
+                errors.append(
+                    f"canonical {class_id}.{boundary}_disposition is invalid"
+                )
+            if escalation not in escalation_values:
+                errors.append(
+                    f"canonical {class_id}.{boundary}_escalation is invalid"
+                )
+
+    bindings = document.get("profile_bindings")
+    binding: Mapping[str, Any] | None = None
+    if isinstance(bindings, list):
+        for candidate in bindings:
+            if isinstance(candidate, Mapping) and candidate.get("profile") == profile:
+                binding = candidate
+                break
+    if binding is None:
+        errors.append(f"missing canonical profile binding for {profile!r}")
+
+    authorities_value = document.get("authorities")
+    authorities = authorities_value if isinstance(authorities_value, Mapping) else {}
+    boundary_authorities: dict[str, str] = {}
+    if binding is not None:
+        for boundary, field in (("parent", "parent_authority"), ("leaf", "leaf_authority")):
+            authority = binding.get(field)
+            if not isinstance(authority, str) or not authority:
+                errors.append(f"profile binding {profile!r} has no {field}")
+                continue
+            if authority not in authorities or not isinstance(authorities[authority], Mapping):
+                errors.append(f"profile binding {profile!r} references unknown authority {authority!r}")
+                continue
+            boundary_authorities[boundary] = authority
+
+    disposition_rank = _permission_resolution_order(
+        contract.get("overlap_resolution"),
+        disposition_values,
+        "canonical overlap_resolution",
+        errors,
+    )
+    escalation_rank = _permission_resolution_order(
+        contract.get("overlap_escalation_resolution"),
+        escalation_values,
+        "canonical overlap_escalation_resolution",
+        errors,
+    )
+    if errors:
+        return None, errors
+    return {
+        "classes": class_ids,
+        "operations": operations,
+        "authorities": boundary_authorities,
+        "disposition_rank": disposition_rank,
+        "escalation_rank": escalation_rank,
+    }, []
+
+
+def _permission_manifest_schema(
+    document: Any,
+    profile: str,
+    class_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Validate and normalize the closed consumer-owned permission manifest."""
+    errors: list[str] = []
+    if not isinstance(document, Mapping):
+        return [], [], ["manifest is not a table"]
+
+    unknown = set(document) - PERMISSION_MANIFEST_KEYS
+    missing = PERMISSION_MANIFEST_KEYS - set(document)
+    if unknown:
+        errors.append(f"manifest unknown fields={sorted(unknown)!r}")
+    if missing:
+        errors.append(f"manifest missing fields={sorted(missing)!r}")
+
+    if type(document.get("schema_version")) is not int or document.get("schema_version") != 1:
+        errors.append("manifest schema_version must be 1")
+    if document.get("contract") != "permission-semantics":
+        errors.append("manifest contract must be 'permission-semantics'")
+    manifest_profile = document.get("profile")
+    if not isinstance(manifest_profile, str) or manifest_profile not in PROFILE_AGENT_DIRS:
+        errors.append(f"manifest invalid profile={manifest_profile!r}")
+    elif manifest_profile != profile:
+        errors.append(
+            f"manifest profile={manifest_profile!r} does not match selected profile={profile!r}"
+        )
+
+    surfaces_value = document.get("surfaces")
+    surface_order: list[str] = []
+    surfaces: dict[str, dict[str, Any]] = {}
+    seen_sources: set[str] = set()
+    if not isinstance(surfaces_value, list):
+        errors.append("manifest surfaces must be a list")
+    elif not surfaces_value:
+        errors.append("manifest surfaces must not be empty")
+    else:
+        for index, item in enumerate(surfaces_value):
+            location = f"surfaces[{index}]"
+            if not isinstance(item, Mapping):
+                errors.append(f"{location} must be a table")
+                continue
+            item_unknown = set(item) - PERMISSION_SURFACE_KEYS
+            item_missing = PERMISSION_SURFACE_KEYS - set(item)
+            if item_unknown:
+                errors.append(f"{location} unknown fields={sorted(item_unknown)!r}")
+            if item_missing:
+                errors.append(f"{location} missing fields={sorted(item_missing)!r}")
+
+            surface_id = item.get("id")
+            if not isinstance(surface_id, str) or not surface_id:
+                errors.append(f"{location}.id must be a non-empty string")
+                surface_id = None
+            elif surface_id in surfaces:
+                errors.append(f"{location}.id duplicate={surface_id!r}")
+                surface_id = None
+
+            boundary = item.get("boundary")
+            if not isinstance(boundary, str) or boundary not in PERMISSION_BOUNDARIES:
+                errors.append(f"{location}.boundary invalid={boundary!r}")
+                boundary = None
+            source_kind = item.get("source_kind")
+            if not isinstance(source_kind, str) or source_kind not in PERMISSION_SOURCE_KINDS:
+                errors.append(f"{location}.source_kind invalid={source_kind!r}")
+                source_kind = None
+
+            source_values = item.get("sources")
+            normalized_sources: list[str] = []
+            if not isinstance(source_values, list):
+                errors.append(f"{location}.sources must be a list")
+            elif not source_values:
+                errors.append(f"{location}.sources must not be empty")
+            else:
+                for source_index, source in enumerate(source_values):
+                    source_location = f"{location}.sources[{source_index}]"
+                    if not isinstance(source, str) or not source:
+                        errors.append(f"{source_location} must be a non-empty string")
+                        continue
+                    if Path(source).is_absolute():
+                        errors.append(f"{source_location} must be relative")
+                    if any(part in {".", ".."} for part in Path(source).parts):
+                        errors.append(f"{source_location} must be normalized")
+                    if source in seen_sources:
+                        errors.append(f"{source_location} duplicate={source!r}")
+                    seen_sources.add(source)
+                    normalized_sources.append(source)
+
+            if surface_id is not None:
+                surface_order.append(surface_id)
+                surfaces[surface_id] = {
+                    "id": surface_id,
+                    "boundary": boundary,
+                    "source_kind": source_kind,
+                    "sources": normalized_sources,
+                    "probes": [],
+                }
+
+    probes_value = document.get("probes")
+    probes: list[dict[str, Any]] = []
+    seen_probe_keys: set[tuple[str, str, str]] = set()
+    covered: dict[str, set[str]] = {surface_id: set() for surface_id in surface_order}
+    class_set = set(class_ids)
+    if not isinstance(probes_value, list):
+        errors.append("manifest probes must be a list")
+    elif not probes_value:
+        errors.append("manifest probes must not be empty")
+    else:
+        for index, item in enumerate(probes_value):
+            location = f"probes[{index}]"
+            if not isinstance(item, Mapping):
+                errors.append(f"{location} must be a table")
+                continue
+            item_unknown = set(item) - PERMISSION_PROBE_KEYS
+            item_missing = PERMISSION_PROBE_KEYS - set(item)
+            if item_unknown:
+                errors.append(f"{location} unknown fields={sorted(item_unknown)!r}")
+            if item_missing:
+                errors.append(f"{location} missing fields={sorted(item_missing)!r}")
+
+            surface_id = item.get("surface")
+            tool = item.get("tool")
+            input_value = item.get("input")
+            valid_identity = (
+                isinstance(surface_id, str)
+                and bool(surface_id)
+                and isinstance(tool, str)
+                and bool(tool)
+                and isinstance(input_value, str)
+                and bool(input_value)
+            )
+            if not isinstance(surface_id, str) or not surface_id:
+                errors.append(f"{location}.surface must be a non-empty string")
+            elif surface_id not in surfaces:
+                errors.append(f"{location}.surface dangling={surface_id!r}")
+            if not isinstance(tool, str) or not tool:
+                errors.append(f"{location}.tool must be a non-empty string")
+            if not isinstance(input_value, str) or not input_value:
+                errors.append(f"{location}.input must be a non-empty string")
+
+            class_values = item.get("classes")
+            normalized_classes: list[str] = []
+            if not isinstance(class_values, list):
+                errors.append(f"{location}.classes must be a list")
+            elif not class_values:
+                errors.append(f"{location}.classes must not be empty")
+            else:
+                seen_classes: set[str] = set()
+                for class_index, class_id in enumerate(class_values):
+                    class_location = f"{location}.classes[{class_index}]"
+                    if not isinstance(class_id, str) or not class_id:
+                        errors.append(f"{class_location} must be a non-empty string")
+                        continue
+                    if class_id not in class_set:
+                        errors.append(f"{class_location} unknown={class_id!r}")
+                    if class_id in seen_classes:
+                        errors.append(f"{class_location} duplicate={class_id!r}")
+                    seen_classes.add(class_id)
+                    normalized_classes.append(class_id)
+
+            if valid_identity:
+                probe_key = (surface_id, tool, input_value)
+                if probe_key in seen_probe_keys:
+                    input_digest = hashlib.sha256(input_value.encode("utf-8")).hexdigest()
+                    errors.append(
+                        f"{location} duplicate=surface={surface_id!r}:tool={tool!r}:"
+                        f"input_sha256={input_digest}"
+                    )
+                seen_probe_keys.add(probe_key)
+                probe = {
+                    "surface": surface_id,
+                    "tool": tool,
+                    "input": input_value,
+                    "classes": normalized_classes,
+                }
+                probes.append(probe)
+                if surface_id in surfaces:
+                    surfaces[surface_id]["probes"].append(probe)
+                    covered[surface_id].update(
+                        class_id for class_id in normalized_classes if class_id in class_set
+                    )
+
+    for surface_id in surface_order:
+        missing_classes = [
+            class_id for class_id in class_ids if class_id not in covered[surface_id]
+        ]
+        if missing_classes:
+            errors.append(
+                f"surface={surface_id!r} missing_coverage={missing_classes!r}"
+            )
+
+    declared_boundaries = {
+        surface["boundary"]
+        for surface in surfaces.values()
+        if surface["boundary"] in PERMISSION_BOUNDARIES
+    }
+    for boundary in sorted(PERMISSION_BOUNDARIES - declared_boundaries):
+        errors.append(f"missing_boundary_surface={boundary}")
+
+    return [surfaces[surface_id] for surface_id in surface_order], probes, errors
+
+
+def _permission_source_path(
+    manifest_dir: Path,
+    consumer_root: Path,
+    source: str,
+) -> tuple[Path | None, str, str | None]:
+    """Resolve one declared source while retaining consumer confinement."""
+    raw_path = Path(source)
+    if raw_path.is_absolute():
+        return None, "error", "source_is_absolute"
+    try:
+        path = manifest_dir / raw_path
+        if not _is_confined_path(path, consumer_root) or not _is_confined_path(path, manifest_dir):
+            return None, "error", "source_path_not_confined"
+        if path.is_symlink():
+            return None, "error", "source_not_regular_or_symlink"
+        if not path.exists():
+            return path, "missing", "source_missing"
+        if not path.is_file():
+            return None, "error", "source_not_regular"
+    except (OSError, ValueError) as exc:
+        return None, "error", f"source_path_error={exc}"
+    return path, "ok", None
+
+
+def _permission_expected_sources(
+    profile: str,
+    documents: Mapping[str, Mapping[str, Any]],
+) -> dict[str, tuple[str, str]]:
+    """Return the profile-owned permission sources that cannot be omitted."""
+    prefix = "agents" if profile == "global" else ".opencode/agents"
+    assignments = documents.get(profile, {}).get("assignments", {})
+    expected = {"opencode.json": ("json", "parent")}
+    if isinstance(assignments, Mapping):
+        expected.update(
+            {
+                f"{prefix}/{role}.md": (
+                    "agent-frontmatter",
+                    "parent"
+                    if profile == "agent-core" and role == "task-orchestrator"
+                    else "leaf",
+                )
+                for role in assignments
+                if isinstance(role, str) and role
+            }
+        )
+    return expected
+
+
+def _permission_source_inventory_errors(
+    profile: str,
+    agent_dir: Path,
+    documents: Mapping[str, Mapping[str, Any]],
+    surfaces: list[dict[str, Any]],
+) -> list[str]:
+    """Require all canonical profile-owned JSON and role frontmatter sources."""
+    expected = _permission_expected_sources(profile, documents)
+    declared: dict[str, tuple[str, str]] = {}
+    for surface in surfaces:
+        for source in surface["sources"]:
+            declared[source] = (surface["source_kind"], surface["boundary"])
+
+    errors: list[str] = []
+    for source, (source_kind, boundary) in expected.items():
+        actual = declared.get(source)
+        if actual is None:
+            errors.append(f"missing_declared_source={source}")
+        elif actual[0] != source_kind:
+            errors.append(
+                f"source_kind_mismatch={source}:actual={actual[0]}:expected={source_kind}"
+            )
+        elif actual[1] != boundary:
+            errors.append(
+                f"source_boundary_mismatch={source}:actual={actual[1]}:expected={boundary}"
+            )
+
+    prefix = "agents" if profile == "global" else ".opencode/agents"
+    for source, (source_kind, boundary) in declared.items():
+        if source in expected:
+            continue
+        # Additional consumer-owned agents remain supported, but they must be
+        # real files in the selected agent inventory. In particular, an
+        # arbitrary benign file cannot satisfy a required leaf surface.
+        if source_kind != "agent-frontmatter" or boundary != "leaf":
+            errors.append(f"undeclared_source={source}")
+            continue
+        relative_agent = Path(source)
+        if (
+            not source.startswith(f"{prefix}/")
+            or relative_agent.suffix != ".md"
+            or not (agent_dir / relative_agent.relative_to(prefix)).is_file()
+            or (agent_dir / relative_agent.relative_to(prefix)).is_symlink()
+        ):
+            errors.append(f"undeclared_source={source}")
+    return errors
+
+
+def _permission_read_source(
+    path: Path,
+    consumer_root: Path,
+    source_kind: str,
+) -> tuple[Any, str | None, str]:
+    """Read one JSON or bounded frontmatter permission source."""
+    content, read_status, read_reason = _secure_read_file(path, consumer_root)
+    if read_status != "ok" or content is None:
+        return (
+            _PERMISSION_MISSING,
+            f"source_secure_read={read_reason or read_status}",
+            read_status,
+        )
+    try:
+        text = content.decode("utf-8")
+        if source_kind == "json":
+            document = json.loads(text)
+        else:
+            document = _parse_bounded_frontmatter(text)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return _PERMISSION_MISSING, f"source_parse_error={exc}", "error"
+    if not isinstance(document, Mapping):
+        return _PERMISSION_MISSING, "source_document_not_a_mapping", "error"
+    return document.get("permission", _PERMISSION_MISSING), None, "ok"
+
+
+def _permission_value_error(value: Any) -> str | None:
+    """Validate action scalar and per-tool ordered pattern-map shapes."""
+    if value is _PERMISSION_MISSING:
+        return None
+    if isinstance(value, str):
+        if value not in PERMISSION_ACTIONS:
+            return f"invalid_action={value!r}"
+        return None
+    if not isinstance(value, Mapping):
+        return "non_string_action=permission"
+
+    for tool, rule in value.items():
+        if not isinstance(tool, str):
+            return "non_string_action=tool_key"
+        if isinstance(rule, str):
+            if rule not in PERMISSION_ACTIONS:
+                return f"invalid_action={rule!r} tool={tool!r}"
+            continue
+        if not isinstance(rule, Mapping):
+            return f"non_string_action=tool={tool!r}"
+        for pattern, action in rule.items():
+            if not isinstance(pattern, str):
+                return f"non_string_action=pattern tool={tool!r}"
+            if not isinstance(action, str):
+                return f"non_string_action=pattern={pattern!r} tool={tool!r}"
+            if action not in PERMISSION_ACTIONS:
+                return f"invalid_action={action!r} pattern={pattern!r} tool={tool!r}"
+    return None
+
+
+def _permission_effective_action(
+    value: Any,
+    tool: str,
+    input_value: str,
+    inherited: tuple[Any, ...] = (),
+) -> str:
+    """Evaluate ordered OpenCode rules, including inherited config layers."""
+    # OpenCode flattens each configured layer in insertion order, merges the
+    # layers, and applies the last rule matching both permission and input.
+    # This matters when a broad permission key such as "*" appears after a
+    # tool-specific rule, or when an agent overrides the project map.
+    effective = "ask"
+    for layer in (*inherited, value):
+        if layer is _PERMISSION_MISSING:
+            continue
+        if isinstance(layer, str):
+            effective = layer
+            continue
+        if not isinstance(layer, Mapping):
+            continue
+        for permission_pattern, configured in layer.items():
+            if not _permission_wildcard_match(permission_pattern, tool):
+                continue
+            if isinstance(configured, str):
+                effective = configured
+                continue
+            if not isinstance(configured, Mapping):
+                continue
+            for input_pattern, action in configured.items():
+                if _permission_wildcard_match(input_pattern, input_value):
+                    effective = action
+    return effective
+
+
+def _permission_observation_line(
+    status: str,
+    profile: str,
+    surface: Mapping[str, Any],
+    source: str,
+    probe: Mapping[str, Any],
+    authority: str,
+    expected: str,
+    actual: str,
+    expected_escalation: str,
+    reason: str | None = None,
+) -> str:
+    classes = ",".join(probe["classes"])
+    input_digest = hashlib.sha256(probe["input"].encode("utf-8")).hexdigest()
+    line = (
+        f"{status} profile={profile} surface={surface['id']} source={source} "
+        f"classes={classes} boundary={surface['boundary']} authority={authority} "
+        f"expected={expected} actual={actual} input_sha256={input_digest} "
+        f"expected_escalation={expected_escalation}"
+    )
+    if reason:
+        line += f" reason={reason.replace(chr(10), ' ')}"
+    return line
+
+
+def _audit_permission_contract(
+    profile: str,
+    consumer_root: Path,
+    agent_dir: Path,
+    documents: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[str], Counter[str]]:
+    """Audit consumer-owned permission probes against the canonical semantics."""
+    lines: list[str] = []
+    counts: Counter[str] = Counter()
+    bundle_dir = _permission_bundle_dir(profile, agent_dir)
+    manifest = bundle_dir / PERMISSION_MANIFEST_NAME
+
+    if not _is_confined_path(bundle_dir, consumer_root):
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            "reason=manifest_path_not_confined"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+    if manifest.is_symlink():
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            "reason=manifest_not_regular_or_symlink"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+    if not _is_confined_path(manifest, consumer_root):
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            "reason=manifest_path_not_confined"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+    manifest_content, manifest_status, manifest_reason = _secure_read_file(
+        manifest,
+        consumer_root,
+    )
+    if manifest_status == "missing":
+        lines.append(
+            f"MISSING UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            "reason=manifest_missing"
+        )
+        counts["MISSING"] += 1
+        return lines, counts
+    if manifest_status != "ok" or manifest_content is None:
+        reason = "manifest_not_regular" if manifest_reason == "not_regular" else (
+            f"manifest_secure_read_error={manifest_reason or manifest_status}"
+        )
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            f"reason={reason}"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+
+    try:
+        manifest_document = tomllib.loads(manifest_content.decode("utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            f"reason=manifest_parse_error={str(exc).replace(chr(10), ' ')}"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+
+    context, context_errors = _permission_contract_context(profile, documents)
+    if context is None:
+        reason = ";".join(context_errors)
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            f"reason=canonical_permission_contract_invalid={reason}"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+
+    surfaces, _probes, manifest_errors = _permission_manifest_schema(
+        manifest_document,
+        profile,
+        context["classes"],
+    )
+    if manifest_errors:
+        reason = ";".join(manifest_errors)
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            f"reason=manifest_schema_invalid={reason}"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+
+    inventory_errors = _permission_source_inventory_errors(
+        profile,
+        agent_dir,
+        documents,
+        surfaces,
+    )
+    if inventory_errors:
+        reason = ";".join(inventory_errors)
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            f"reason=manifest_source_inventory_invalid={reason}"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+
+    source_results: dict[str, tuple[str, Any, str | None]] = {}
+    for surface in surfaces:
+        for source in surface["sources"]:
+            if source in source_results:
+                continue
+            source_path, source_status, source_reason = _permission_source_path(
+                bundle_dir,
+                consumer_root,
+                source,
+                )
+            if source_status == "ok" and source_path is not None:
+                permission_value, parse_reason, read_status = _permission_read_source(
+                    source_path,
+                    consumer_root,
+                    surface["source_kind"],
+                )
+                if parse_reason:
+                    source_results[source] = (
+                        "missing" if read_status == "missing" else "error",
+                        _PERMISSION_MISSING,
+                        parse_reason,
+                    )
+                else:
+                    value_reason = _permission_value_error(permission_value)
+                    source_results[source] = (
+                        "error" if value_reason else "ok",
+                        permission_value,
+                        value_reason,
+                    )
+            else:
+                source_results[source] = (
+                    source_status,
+                    _PERMISSION_MISSING,
+                    source_reason,
+                )
+
+    base_result = source_results.get("opencode.json")
+    for surface in surfaces:
+        boundary = surface["boundary"]
+        authority = context["authorities"][boundary]
+        operations = context["operations"]
+        disposition_rank = context["disposition_rank"]
+        escalation_rank = context["escalation_rank"]
+        for probe in surface["probes"]:
+            expected_dispositions = [
+                operations[class_id][f"{boundary}_disposition"]
+                for class_id in probe["classes"]
+            ]
+            expected_escalations = [
+                operations[class_id][f"{boundary}_escalation"]
+                for class_id in probe["classes"]
+            ]
+            expected = max(expected_dispositions, key=disposition_rank.__getitem__)
+            expected_escalation = max(
+                expected_escalations,
+                key=escalation_rank.__getitem__,
+            )
+
+            for source in surface["sources"]:
+                source_status, permission_value, source_reason = source_results[source]
+                inherited: tuple[Any, ...] = ()
+                if surface["source_kind"] == "agent-frontmatter" and base_result is not None:
+                    base_status, base_value, base_reason = base_result
+                    if base_status == "ok":
+                        inherited = (base_value,)
+                    elif source_status == "ok":
+                        source_status = "error"
+                        source_reason = f"inherited_opencode_json={base_reason or base_status}"
+                if source_status == "ok":
+                    actual = _permission_effective_action(
+                        permission_value,
+                        probe["tool"],
+                        probe["input"],
+                        inherited,
+                    )
+                    if actual == expected:
+                        lines.append(
+                            _permission_observation_line(
+                                "PASS",
+                                profile,
+                                surface,
+                                source,
+                                probe,
+                                authority,
+                                expected,
+                                actual,
+                                expected_escalation,
+                            )
+                        )
+                        counts["PASS"] += 1
+                    else:
+                        lines.append(
+                            _permission_observation_line(
+                                "DIFF UNEXPECTED_DRIFT",
+                                profile,
+                                surface,
+                                source,
+                                probe,
+                                authority,
+                                expected,
+                                actual,
+                                expected_escalation,
+                                "permission_action_mismatch",
+                            )
+                        )
+                        counts["DIFF"] += 1
+                else:
+                    status = "MISSING UNEXPECTED_DRIFT" if source_status == "missing" else "DIFF UNEXPECTED_DRIFT"
+                    actual = "unavailable" if source_status == "missing" else "invalid_source"
+                    lines.append(
+                        _permission_observation_line(
+                            status,
+                            profile,
+                            surface,
+                            source,
+                            probe,
+                            authority,
+                            expected,
+                            actual,
+                            expected_escalation,
+                            source_reason,
+                        )
+                    )
+                    counts["MISSING" if source_status == "missing" else "DIFF"] += 1
+    return lines, counts
+
+
 def _audit_local_workers(
     consumer_root: Path,
     documents: Mapping[str, Mapping[str, Any]],
@@ -138,14 +1185,23 @@ def _audit_local_workers(
     if not _is_confined_path(agent_dir, consumer_root):
         return [], Counter()
     manifest = agent_dir.parent / "local-workers.toml"
-    if not manifest.exists() and not manifest.is_symlink():
-        return ["PASS local_workers=absent"], Counter(PASS=1)
-    if manifest.is_symlink() or not manifest.is_file():
+    if manifest.is_symlink():
         return ["DIFF UNEXPECTED_DRIFT local_workers=manifest_not_regular"], Counter(DIFF=1)
 
+    manifest_content, manifest_status, manifest_reason = _secure_read_file(
+        manifest,
+        consumer_root,
+    )
+    if manifest_status == "missing":
+        return ["PASS local_workers=absent"], Counter(PASS=1)
+    if manifest_status != "ok" or manifest_content is None:
+        reason = "manifest_not_regular" if manifest_reason == "not_regular" else (
+            f"manifest_secure_read_error={manifest_reason or manifest_status}"
+        )
+        return [f"DIFF UNEXPECTED_DRIFT local_workers={reason}"], Counter(DIFF=1)
+
     try:
-        with manifest.open("rb") as handle:
-            doc = tomllib.load(handle)
+        doc = tomllib.loads(manifest_content.decode("utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         return [f"DIFF UNEXPECTED_DRIFT local_workers=parse_error={exc}"], Counter(DIFF=1)
 
@@ -192,13 +1248,20 @@ def _audit_local_workers(
     }
     config_path = agent_dir.parent / "opencode.json"
     config: Any = None
-    if config_path.is_symlink() or not config_path.is_file():
+    if config_path.is_symlink():
         errors.append("opencode_json_missing_or_not_regular")
     else:
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        config_content, config_status, _config_reason = _secure_read_file(
+            config_path,
+            consumer_root,
+        )
+        if config_status != "ok" or config_content is None:
             errors.append("opencode_json_invalid")
+        else:
+            try:
+                config = json.loads(config_content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                errors.append("opencode_json_invalid")
     provider_table = config.get("provider") if isinstance(config, dict) else None
     if not isinstance(provider_table, dict):
         provider_table = {}
@@ -232,12 +1295,12 @@ def _audit_local_workers(
         if agent.is_symlink() or not agent.is_file():
             errors.append(f"agent_{worker}_missing_or_not_regular")
             continue
-        frontmatter = parse_frontmatter(agent)
+        frontmatter = parse_frontmatter(agent, consumer_root)
         if frontmatter.get("mode") != worker_policy["mode"] or frontmatter.get("hidden") is not worker_policy["hidden"]:
             errors.append(f"agent_{worker}_visibility_or_mode")
         if frontmatter.get("model") != binding or frontmatter.get("model") in canonical_models:
             errors.append(f"agent_{worker}_binding")
-        if _frontmatter_permissions(agent) != required_permissions:
+        if _frontmatter_permissions(agent, consumer_root) != required_permissions:
             errors.append(f"agent_{worker}_permissions")
 
     metrics = doc.get("metrics")
@@ -290,6 +1353,16 @@ def _audit_profile_contract(
         )
         counts["DIFF"] += 1
         return lines, counts
+
+    permission_lines, permission_counts = _audit_permission_contract(
+        profile,
+        consumer_root,
+        agent_dir,
+        documents,
+    )
+    lines.extend(permission_lines)
+    counts.update(permission_counts)
+
     if not agent_dir.is_dir():
         lines.append(f"MISSING UNEXPECTED_DRIFT profile={profile} agent_directory={agent_dir}")
         counts["MISSING"] += 1
@@ -325,7 +1398,7 @@ def _audit_profile_contract(
             lines.append(f"MISSING UNEXPECTED_DRIFT profile={profile} role={role_id} agent={role_id}")
             counts["MISSING"] += 1
         else:
-            primary = parse_frontmatter(primary_path)
+            primary = parse_frontmatter(primary_path, consumer_root)
             if primary.get("model") != expected_model:
                 lines.append(
                     f"DIFF UNEXPECTED_DRIFT profile={profile} role={role_id} primary_model="

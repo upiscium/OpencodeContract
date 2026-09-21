@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,8 +14,52 @@ TOOLS = ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 
 from audit_consumers import audit  # noqa: E402
-from policy_audit import audit_profile, result_exit_code  # noqa: E402
+from policy_audit import (  # noqa: E402
+    _permission_wildcard_match,
+    audit_profile,
+    result_exit_code,
+)
 from validate_policy import load_policy  # noqa: E402
+
+
+PERMISSION_CLASSES = (
+    "safe-read-only",
+    "local-filesystem-delete",
+    "repository-history-destruction",
+    "remote-destructive-operation",
+    "privilege-escalation",
+    "system-store-destruction",
+)
+PERMISSION_PROBES = (
+    ("git status", "safe-read-only"),
+    ("rm -rf cache", "local-filesystem-delete"),
+    ("git reset --hard HEAD", "repository-history-destruction"),
+    ("git push --force origin main", "remote-destructive-operation"),
+    ("sudo command", "privilege-escalation"),
+    ("nix store delete /nix/store/example", "system-store-destruction"),
+)
+PARENT_BASH_PERMISSIONS = {
+    "*": "ask",
+    "git status*": "allow",
+    "rm*": "ask",
+    "git reset --hard*": "deny",
+    "git clean*": "deny",
+    "git push --force*": "deny",
+    "git push --delete*": "deny",
+    "sudo*": "deny",
+    "nix store delete*": "deny",
+}
+LEAF_BASH_PERMISSIONS = {
+    "*": "ask",
+    "git status*": "allow",
+    "rm*": "deny",
+    "git reset --hard*": "deny",
+    "git clean*": "deny",
+    "git push --force*": "deny",
+    "git push --delete*": "deny",
+    "sudo*": "deny",
+    "nix store delete*": "deny",
+}
 
 
 class ConsumerAuditCliTest(unittest.TestCase):
@@ -25,9 +71,13 @@ class ConsumerAuditCliTest(unittest.TestCase):
 
     def make_consumer(self, root: Path, profile: str, *, with_model_fallback: bool = False) -> Path:
         consumer = root / profile
+        bundle = {
+            "global": consumer / "config.d/opencode",
+            "agent-core": consumer / "components/agent-core",
+        }[profile]
         agent_dir = {
-            "global": consumer / "config.d/opencode/agents",
-            "agent-core": consumer / "components/agent-core/.opencode/agents",
+            "global": bundle / "agents",
+            "agent-core": bundle / ".opencode/agents",
         }[profile]
         agent_dir.mkdir(parents=True)
         models = self.documents["models"]["models"]
@@ -35,10 +85,69 @@ class ConsumerAuditCliTest(unittest.TestCase):
         assignments = self.documents[profile]["assignments"]
         for role, assignment in assignments.items():
             mode = roles[role]["kind"]
-            model = models[assignment["primary_model"]]["id"]
-            (agent_dir / f"{role}.md").write_text(
-                f"---\nmode: {mode}\nmodel: {model}\n---\n", encoding="utf-8"
+            role_permissions = (
+                PARENT_BASH_PERMISSIONS
+                if profile == "agent-core" and role == "task-orchestrator"
+                else LEAF_BASH_PERMISSIONS
             )
+            model = models[assignment["primary_model"]]["id"]
+            permission_lines = "\n".join(
+                f"    {json.dumps(pattern)}: {action}"
+                for pattern, action in role_permissions.items()
+            )
+            (agent_dir / f"{role}.md").write_text(
+                f"---\nmode: {mode}\nmodel: {model}\n"
+                f"permission:\n  bash:\n{permission_lines}\n---\n",
+                encoding="utf-8",
+            )
+
+        (bundle / "opencode.json").write_text(
+            json.dumps({"permission": {"bash": PARENT_BASH_PERMISSIONS}}),
+            encoding="utf-8",
+        )
+        source_prefix = "agents" if profile == "global" else ".opencode/agents"
+        surface_sources = [("parent", "parent", "json", ["opencode.json"])]
+        surface_sources.extend(
+            (
+                role,
+                "parent" if profile == "agent-core" and role == "task-orchestrator" else "leaf",
+                "agent-frontmatter",
+                [f"{source_prefix}/{role}.md"],
+            )
+            for role in assignments
+        )
+        manifest_lines = [
+            "schema_version = 1",
+            'contract = "permission-semantics"',
+            f'profile = "{profile}"',
+        ]
+        for surface_id, boundary, source_kind, sources in surface_sources:
+            manifest_lines.extend(
+                [
+                    "",
+                    "[[surfaces]]",
+                    f'id = "{surface_id}"',
+                    f'boundary = "{boundary}"',
+                    f'source_kind = "{source_kind}"',
+                    f"sources = [{', '.join(json.dumps(source) for source in sources)}]",
+                ]
+            )
+        for surface_id, _, _, _ in surface_sources:
+            for input_value, class_id in PERMISSION_PROBES:
+                manifest_lines.extend(
+                    [
+                        "",
+                        "[[probes]]",
+                        f'surface = "{surface_id}"',
+                        'tool = "bash"',
+                        f"input = {json.dumps(input_value)}",
+                        f'classes = ["{class_id}"]',
+                    ]
+                )
+        (bundle / "opencode-contract-permissions.toml").write_text(
+            "\n".join(manifest_lines) + "\n",
+            encoding="utf-8",
+        )
 
         if profile == "agent-core" and with_model_fallback:
             binding = consumer / "components/agent-core/.automation/model-fallback.toml"
@@ -90,7 +199,10 @@ class ConsumerAuditCliTest(unittest.TestCase):
             provider: {"models": {model: {"name": model}}}
             for provider, model in bindings.values()
         }
-        (bundle / "opencode.json").write_text(json.dumps({"provider": providers}), encoding="utf-8")
+        config_path = bundle / "opencode.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["provider"] = providers
+        config_path.write_text(json.dumps(config), encoding="utf-8")
         (bundle / "local-workers.toml").write_text(
             """schema_version = 1
 profile = "global"
@@ -167,6 +279,362 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             self.assertIn("PASS profile=agent-core role=plan mode=primary", lines)
             self.assertIn("PASS profile=agent-core model_fallback_policy=absent", lines)
             self.assertFalse(any("local_workers=" in line for line in lines))
+
+    def test_permission_surfaces_cover_all_classes_and_parse_nested_frontmatter(self) -> None:
+        for profile in ("global", "agent-core"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), profile)
+                lines, counts = audit_profile(profile, consumer, self.documents)
+                self.assertEqual(0, counts["DIFF"], lines)
+                self.assertEqual(0, counts["MISSING"], lines)
+                surfaces = ["parent", *self.documents[profile]["assignments"]]
+                for surface in surfaces:
+                    observed = {
+                        class_id
+                        for _, class_id in PERMISSION_PROBES
+                        if any(
+                            line.startswith(f"PASS profile={profile} surface={surface} ")
+                            and f"classes={class_id}" in line
+                            for line in lines
+                        )
+                    }
+                    self.assertEqual(set(PERMISSION_CLASSES), observed, surface)
+                source = (
+                    "agents/plan.md"
+                    if profile == "global"
+                    else ".opencode/agents/plan.md"
+                )
+                self.assertTrue(
+                    any(
+                        line.startswith(
+                            f"PASS profile={profile} surface=plan source={source}"
+                        )
+                        and "classes=local-filesystem-delete" in line
+                        and "actual=deny" in line
+                        for line in lines
+                    ),
+                    lines,
+                )
+
+    def test_missing_permission_manifest_is_missing_and_strict_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            manifest.unlink()
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["MISSING"], lines)
+            self.assertEqual(1, result_exit_code(lines, counts, strict=True))
+            self.assertTrue(any("reason=manifest_missing" in line for line in lines), lines)
+            result = self.run_cli(
+                "audit-consumer",
+                "--profile",
+                "global",
+                "--consumer",
+                str(consumer),
+                "--strict",
+            )
+            self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+
+    def test_permission_manifest_schema_errors_are_controlled_diffs(self) -> None:
+        variants = (
+            ("malformed", "schema_version = 1\nnot = [\n", "manifest_parse_error"),
+            (
+                "unknown top-level field",
+                'profile = "global"\nunknown = true\n',
+                "unknown fields",
+            ),
+            (
+                "unknown surface field",
+                'boundary = "parent"\nextra = true\n',
+                "surfaces[0] unknown fields",
+            ),
+            (
+                "unknown probe field",
+                'tool = "bash"\nextra = true\n',
+                "probes[0] unknown fields",
+            ),
+            ("unknown profile", 'profile = "unknown"', "manifest invalid profile"),
+            (
+                "profile mismatch",
+                'profile = "agent-core"',
+                "does not match selected profile",
+            ),
+            ("wrong contract", 'contract = "other-contract"', "manifest contract"),
+            ("wrong schema", "schema_version = 2", "manifest schema_version"),
+        )
+        for label, replacement, reason in variants:
+            with self.subTest(variant=label), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+                contents = manifest.read_text(encoding="utf-8")
+                if label == "malformed":
+                    contents = replacement
+                elif label == "unknown top-level field":
+                    contents = contents.replace('profile = "global"\n', replacement, 1)
+                elif label == "unknown surface field":
+                    contents = contents.replace(replacement.splitlines()[0], replacement, 1)
+                elif label == "unknown probe field":
+                    contents = contents.replace(replacement.splitlines()[0], replacement, 1)
+                else:
+                    old = {
+                        "unknown profile": 'profile = "global"',
+                        "profile mismatch": 'profile = "global"',
+                        "wrong contract": 'contract = "permission-semantics"',
+                        "wrong schema": "schema_version = 1",
+                    }[label]
+                    contents = contents.replace(old, replacement, 1)
+                manifest.write_text(contents, encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertEqual(0, counts["MISSING"], lines)
+                self.assertTrue(any(reason in line for line in lines), lines)
+
+    def test_permission_manifest_rejects_dangling_surface_and_missing_coverage(self) -> None:
+        variants = (
+            (
+                "dangling surface",
+                lambda contents: contents.replace(
+                    'surface = "parent"', 'surface = "orphan"', 1
+                ),
+                "dangling='orphan'",
+            ),
+            (
+                "missing class coverage",
+                lambda contents: contents.replace(
+                    '[[probes]]\nsurface = "parent"\ntool = "bash"\n'
+                    'input = "git status"\nclasses = ["safe-read-only"]\n\n',
+                    "",
+                    1,
+                ),
+                "surface='parent' missing_coverage",
+            ),
+        )
+        for label, mutate, reason in variants:
+            with self.subTest(variant=label), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+                manifest.write_text(mutate(manifest.read_text(encoding="utf-8")), encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertEqual(0, counts["MISSING"], lines)
+                self.assertTrue(any(reason in line for line in lines), lines)
+
+    def test_permission_manifest_cannot_swap_authority_or_benign_source(self) -> None:
+        variants = (
+            (
+                "boundary swap",
+                lambda contents: contents.replace(
+                    'id = "build"\nboundary = "leaf"',
+                    'id = "build"\nboundary = "parent"',
+                    1,
+                ),
+                "source_boundary_mismatch=agents/build.md",
+            ),
+            (
+                "benign source",
+                lambda contents: contents.replace(
+                    'sources = ["opencode.json"]',
+                    'sources = ["agents/benign.md"]',
+                    1,
+                ),
+                "missing_declared_source=opencode.json",
+            ),
+        )
+        for label, mutate, reason in variants:
+            with self.subTest(variant=label), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+                manifest.write_text(mutate(manifest.read_text(encoding="utf-8")), encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertTrue(any(reason in line for line in lines), lines)
+
+    def test_duplicate_probe_diagnostic_redacts_input(self) -> None:
+        secret = "private-probe-input"
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            contents = manifest.read_text(encoding="utf-8").replace(
+                'input = "git status"',
+                f'input = "{secret}"',
+                1,
+            )
+            contents += (
+                "\n[[probes]]\n"
+                'surface = "parent"\n'
+                'tool = "bash"\n'
+                f'input = "{secret}"\n'
+                'classes = ["safe-read-only"]\n'
+            )
+            manifest.write_text(contents, encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    f"input_sha256={hashlib.sha256(secret.encode()).hexdigest()}" in line
+                    for line in lines
+                ),
+                lines,
+            )
+            self.assertFalse(any(secret in line for line in lines), lines)
+
+    def test_wildcard_matching_handles_long_probe_inputs_without_recursion(self) -> None:
+        long_input = "x" * 100_000
+        self.assertTrue(_permission_wildcard_match("*", long_input))
+        self.assertTrue(_permission_wildcard_match("x*", long_input))
+        self.assertFalse(_permission_wildcard_match("?", long_input))
+
+    def test_non_regular_permission_manifest_fails_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            manifest.unlink()
+            os.mkfifo(manifest)
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(any("reason=manifest_not_regular" in line for line in lines), lines)
+
+    def test_permission_sources_missing_invalid_symlink_and_utf8_fail_closed(self) -> None:
+        source = "agents/plan.md"
+        missing_variants = (
+            ("missing", source, "source_missing"),
+            ("invalid", source, "source_parse_error"),
+            ("symlink", source, "source_path_not_confined"),
+            ("invalid utf8", "opencode.json", "source_parse_error"),
+        )
+        for label, replacement, reason in missing_variants:
+            with self.subTest(source=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                consumer = self.make_consumer(root, "global")
+                bundle = consumer / "config.d/opencode"
+                manifest = bundle / "opencode-contract-permissions.toml"
+                contents = manifest.read_text(encoding="utf-8")
+                if label == "missing":
+                    (bundle / replacement).unlink()
+                elif label == "invalid":
+                    (bundle / source).write_text("not frontmatter\n", encoding="utf-8")
+                elif label == "symlink":
+                    external = root / "external-permission.md"
+                    external.write_text("---\npermission:\n  bash:\n    \"*\": deny\n---\n", encoding="utf-8")
+                    (bundle / source).unlink()
+                    (bundle / source).symlink_to(external)
+                else:
+                    (bundle / replacement).write_bytes(b"\xff\xfe")
+                manifest.write_text(contents, encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                if label == "missing":
+                    self.assertGreaterEqual(counts["MISSING"], 6, lines)
+                else:
+                    self.assertGreater(counts["DIFF"], 0, lines)
+                self.assertEqual(1, result_exit_code(lines, counts, strict=True))
+                self.assertTrue(any(reason in line for line in lines), lines)
+
+    def test_parent_local_delete_deny_or_allow_is_not_conforming(self) -> None:
+        for action in ("deny", "allow"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                config_path = consumer / "config.d/opencode/opencode.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["permission"]["bash"]["rm*"] = action
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertTrue(
+                    any(
+                        "surface=parent" in line
+                        and "expected=ask" in line
+                        and f"actual={action}" in line
+                        for line in lines
+                    ),
+                    lines,
+                )
+
+    def test_leaf_local_delete_allow_or_ask_is_not_conforming(self) -> None:
+        for action in ("allow", "ask"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                agent = consumer / "config.d/opencode/agents/plan.md"
+                contents = agent.read_text(encoding="utf-8").replace(
+                    '    "rm*": deny', f'    "rm*": {action}', 1
+                )
+                agent.write_text(contents, encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertTrue(
+                    any(
+                        "surface=plan" in line
+                        and "expected=deny" in line
+                        and f"actual={action}" in line
+                        for line in lines
+                    ),
+                    lines,
+                )
+
+    def test_structural_permission_classes_reject_ask_and_allow(self) -> None:
+        patterns = {
+            "repository-history-destruction": "git reset --hard*",
+            "remote-destructive-operation": "git push --force*",
+            "privilege-escalation": "sudo*",
+            "system-store-destruction": "nix store delete*",
+        }
+        for boundary in ("parent", "leaf"):
+            for class_id, pattern in patterns.items():
+                for action in ("ask", "allow"):
+                    with self.subTest(boundary=boundary, class_id=class_id, action=action), tempfile.TemporaryDirectory() as temporary:
+                        consumer = self.make_consumer(Path(temporary), "global")
+                        surface = "parent" if boundary == "parent" else "plan"
+                        if boundary == "parent":
+                            config_path = consumer / "config.d/opencode/opencode.json"
+                            config = json.loads(config_path.read_text(encoding="utf-8"))
+                            config["permission"]["bash"][pattern] = action
+                            config_path.write_text(json.dumps(config), encoding="utf-8")
+                        else:
+                            agent = consumer / "config.d/opencode/agents/plan.md"
+                            contents = agent.read_text(encoding="utf-8").replace(
+                                f'    "{pattern}": deny', f'    "{pattern}": {action}', 1
+                            )
+                            agent.write_text(contents, encoding="utf-8")
+                        lines, counts = audit_profile("global", consumer, self.documents)
+                        self.assertEqual(1, counts["DIFF"], lines)
+                        self.assertTrue(
+                            any(
+                                f"surface={surface}" in line
+                                and f"classes={class_id}" in line
+                                and f"actual={action}" in line
+                                for line in lines
+                            ),
+                            lines,
+                        )
+
+    def test_late_stronger_deny_overlap_makes_parent_local_delete_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            config_path = consumer / "config.d/opencode/opencode.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["permission"]["bash"]["rm -rf*"] = "deny"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=parent" in line
+                    and "classes=local-filesystem-delete" in line
+                    and "expected=ask actual=deny" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+    def test_unrelated_unprobed_permission_entry_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            config_path = consumer / "config.d/opencode/opencode.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["permission"]["bash"]["echo*"] = "deny"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(0, counts["DIFF"], lines)
+            self.assertEqual(0, counts["MISSING"], lines)
 
     def test_conforming_optional_local_workers_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -351,7 +819,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 agent.symlink_to(external)
                 lines, counts = audit_profile(profile, consumer, self.documents)
                 self.assertTrue(any("role=plan" in line and "unsafe_path=forbidden" in line for line in lines), lines)
-                self.assertEqual(1, counts["DIFF"])
+                self.assertEqual(7, counts["DIFF"])
 
     def test_agent_core_has_no_optional_worker_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -434,7 +902,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             consumer = self.make_consumer(Path(temporary), "global")
             (consumer / "config.d/opencode/agents/plan.md").unlink()
             _, counts = audit_profile("global", consumer, self.documents)
-            self.assertEqual(1, counts["MISSING"])
+            self.assertEqual(7, counts["MISSING"])
 
     def test_unknown_profile_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

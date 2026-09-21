@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,38 @@ from policy_audit import audit_profile  # noqa: E402
 from validate_policy import load_policy  # noqa: E402
 
 
+PERMISSION_PROBES = (
+    ("git status", "safe-read-only"),
+    ("rm -rf cache", "local-filesystem-delete"),
+    ("git reset --hard HEAD", "repository-history-destruction"),
+    ("git push --force origin main", "remote-destructive-operation"),
+    ("sudo command", "privilege-escalation"),
+    ("nix store delete /nix/store/example", "system-store-destruction"),
+)
+PARENT_BASH_PERMISSIONS = {
+    "*": "ask",
+    "git status*": "allow",
+    "rm*": "ask",
+    "git reset --hard*": "deny",
+    "git clean*": "deny",
+    "git push --force*": "deny",
+    "git push --delete*": "deny",
+    "sudo*": "deny",
+    "nix store delete*": "deny",
+}
+LEAF_BASH_PERMISSIONS = {
+    "*": "ask",
+    "git status*": "allow",
+    "rm*": "deny",
+    "git reset --hard*": "deny",
+    "git clean*": "deny",
+    "git push --force*": "deny",
+    "git push --delete*": "deny",
+    "sudo*": "deny",
+    "nix store delete*": "deny",
+}
+
+
 class PackagedGlobalPathTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -21,6 +54,7 @@ class PackagedGlobalPathTests(unittest.TestCase):
 
     def make_packaged_consumer(self, root: Path) -> tuple[Path, Path]:
         consumer = root / "dotnix"
+        bundle = consumer / "packages/opencode/config"
         agent_dir = consumer / "packages/opencode/config/agents"
         agent_dir.mkdir(parents=True)
 
@@ -29,10 +63,58 @@ class PackagedGlobalPathTests(unittest.TestCase):
         for role, assignment in self.documents["global"]["assignments"].items():
             mode = roles[role]["kind"]
             model = models[assignment["primary_model"]]["id"]
+            permission_lines = "\n".join(
+                f"    {json.dumps(pattern)}: {action}"
+                for pattern, action in LEAF_BASH_PERMISSIONS.items()
+            )
             (agent_dir / f"{role}.md").write_text(
-                f"---\nmode: {mode}\nmodel: {model}\n---\n",
+                f"---\nmode: {mode}\nmodel: {model}\n"
+                f"permission:\n  bash:\n{permission_lines}\n---\n",
                 encoding="utf-8",
             )
+        (bundle / "opencode.json").write_text(
+            json.dumps({"permission": {"bash": PARENT_BASH_PERMISSIONS}}),
+            encoding="utf-8",
+        )
+
+        manifest_lines = [
+            "schema_version = 1",
+            'contract = "permission-semantics"',
+            'profile = "global"',
+            "",
+            "[[surfaces]]",
+            'id = "parent"',
+            'boundary = "parent"',
+            'source_kind = "json"',
+            'sources = ["opencode.json"]',
+            "",
+            "[[surfaces]]",
+            'id = "leaf"',
+            'boundary = "leaf"',
+            'source_kind = "agent-frontmatter"',
+            "sources = ["
+            + ", ".join(
+                json.dumps(f"agents/{role}.md")
+                for role in self.documents["global"]["assignments"]
+            )
+            + "]",
+        ]
+        for surface in ("parent", "leaf"):
+            for input_value, class_id in PERMISSION_PROBES:
+                manifest_lines.extend(
+                    [
+                        "",
+                        "[[probes]]",
+                        f'surface = "{surface}"',
+                        'tool = "bash"',
+                        f"input = {json.dumps(input_value)}",
+                        f'classes = ["{class_id}"]',
+                    ]
+                )
+        (bundle / "opencode-contract-permissions.toml").write_text(
+            "\n".join(manifest_lines) + "\n",
+            encoding="utf-8",
+        )
         return consumer, agent_dir
 
     def test_packaged_global_path_passes(self) -> None:

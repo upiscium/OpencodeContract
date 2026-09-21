@@ -859,7 +859,14 @@ def validate_policy(root: Path = ROOT) -> list[str]:
                         f"({sorted(forbidden_value_keys)})"
                     )
 
-    permission_contract = docs["permission-semantics"].get("contract", {})
+    permission_document = docs["permission-semantics"]
+    permission_contract = (
+        permission_document.get("contract", {})
+        if isinstance(permission_document, dict)
+        else {}
+    )
+    if not isinstance(permission_contract, dict):
+        permission_contract = {}
     required_permission_invariants = permission_contract.get("required_invariant_ids", [])
     if isinstance(required_permission_invariants, list):
         anchored_ids = {
