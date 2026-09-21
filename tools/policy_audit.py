@@ -31,10 +31,11 @@ PERMISSION_MANIFEST_NAME = "opencode-contract-permissions.toml"
 PERMISSION_MANIFEST_KEYS = {
     "schema_version", "contract", "profile", "surfaces", "probes",
 }
-PERMISSION_SURFACE_KEYS = {"id", "boundary", "source_kind", "sources"}
+PERMISSION_SURFACE_KEYS = {
+    "id", "boundary", "base_source", "agent_source", "signals",
+}
 PERMISSION_PROBE_KEYS = {"surface", "tool", "input", "classes"}
 PERMISSION_BOUNDARIES = {"parent", "leaf"}
-PERMISSION_SOURCE_KINDS = {"json", "agent-frontmatter"}
 PERMISSION_ACTIONS = {"allow", "ask", "deny"}
 _PERMISSION_MISSING = object()
 
@@ -306,7 +307,7 @@ def _is_confined_path(path: Path, consumer_root: Path) -> bool:
         resolved_root = consumer_root.resolve()
         if not path.resolve().is_relative_to(resolved_root):
             return False
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return False
     current = consumer_root
     for component in relative.parts:
@@ -452,6 +453,21 @@ def _permission_contract_context(
     else:
         escalation_values = list(escalations)
 
+    signals_value = document.get("signals")
+    signal_ids: list[str] = []
+    if not isinstance(signals_value, Mapping):
+        errors.append("canonical signals are not a table")
+    else:
+        for signal_id, definition in signals_value.items():
+            if not isinstance(signal_id, str) or not signal_id:
+                errors.append(f"invalid canonical signal {signal_id!r}")
+            elif not isinstance(definition, Mapping):
+                errors.append(f"canonical signal {signal_id!r} is not a table")
+            elif signal_id in signal_ids:
+                errors.append(f"duplicate canonical signal {signal_id!r}")
+            else:
+                signal_ids.append(signal_id)
+
     operations_value = document.get("operation_classes")
     operations: dict[str, Mapping[str, Any]] = {}
     if not isinstance(operations_value, list):
@@ -527,15 +543,39 @@ def _permission_contract_context(
         "classes": class_ids,
         "operations": operations,
         "authorities": boundary_authorities,
+        "signals": signal_ids,
         "disposition_rank": disposition_rank,
         "escalation_rank": escalation_rank,
     }, []
+
+
+def _permission_expected_surfaces(
+    profile: str,
+    documents: Mapping[str, Mapping[str, Any]],
+) -> dict[str, tuple[str, str]]:
+    """Return canonical executable role surfaces and their source paths."""
+    profile_document = documents.get(profile, {})
+    surface_policy = profile_document.get("permission_surfaces", {})
+    prefix = "agents" if profile == "global" else ".opencode/agents"
+    expected: dict[str, tuple[str, str]] = {}
+    if not isinstance(surface_policy, Mapping):
+        return expected
+    for boundary, field in (("parent", "parent_roles"), ("leaf", "leaf_roles")):
+        roles = surface_policy.get(field, [])
+        if not isinstance(roles, list):
+            continue
+        for role in roles:
+            if isinstance(role, str) and role:
+                expected[role] = (boundary, f"{prefix}/{role}.md")
+    return expected
 
 
 def _permission_manifest_schema(
     document: Any,
     profile: str,
     class_ids: list[str],
+    expected_surfaces: Mapping[str, tuple[str, str]],
+    signal_ids: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """Validate and normalize the closed consumer-owned permission manifest."""
     errors: list[str] = []
@@ -564,7 +604,6 @@ def _permission_manifest_schema(
     surfaces_value = document.get("surfaces")
     surface_order: list[str] = []
     surfaces: dict[str, dict[str, Any]] = {}
-    seen_sources: set[str] = set()
     if not isinstance(surfaces_value, list):
         errors.append("manifest surfaces must be a list")
     elif not surfaces_value:
@@ -589,46 +628,64 @@ def _permission_manifest_schema(
             elif surface_id in surfaces:
                 errors.append(f"{location}.id duplicate={surface_id!r}")
                 surface_id = None
+            elif surface_id not in expected_surfaces:
+                errors.append(f"{location}.id unknown={surface_id!r}")
 
             boundary = item.get("boundary")
             if not isinstance(boundary, str) or boundary not in PERMISSION_BOUNDARIES:
                 errors.append(f"{location}.boundary invalid={boundary!r}")
                 boundary = None
-            source_kind = item.get("source_kind")
-            if not isinstance(source_kind, str) or source_kind not in PERMISSION_SOURCE_KINDS:
-                errors.append(f"{location}.source_kind invalid={source_kind!r}")
-                source_kind = None
+            base_source = item.get("base_source")
+            if not isinstance(base_source, str) or not base_source:
+                errors.append(f"{location}.base_source must be a non-empty string")
+                base_source = None
+            elif Path(base_source).is_absolute() or any(
+                part in {".", ".."} for part in Path(base_source).parts
+            ):
+                errors.append(f"{location}.base_source must be normalized and relative")
 
-            source_values = item.get("sources")
-            normalized_sources: list[str] = []
-            if not isinstance(source_values, list):
-                errors.append(f"{location}.sources must be a list")
-            elif not source_values:
-                errors.append(f"{location}.sources must not be empty")
+            agent_source = item.get("agent_source")
+            if not isinstance(agent_source, str) or not agent_source:
+                errors.append(f"{location}.agent_source must be a non-empty string")
+                agent_source = None
+            elif Path(agent_source).is_absolute() or any(
+                part in {".", ".."} for part in Path(agent_source).parts
+            ):
+                errors.append(f"{location}.agent_source must be normalized and relative")
+
+            signal_values = item.get("signals")
+            signals: list[str] = []
+            if not isinstance(signal_values, list):
+                errors.append(f"{location}.signals must be a list")
             else:
-                for source_index, source in enumerate(source_values):
-                    source_location = f"{location}.sources[{source_index}]"
-                    if not isinstance(source, str) or not source:
-                        errors.append(f"{source_location} must be a non-empty string")
-                        continue
-                    if Path(source).is_absolute():
-                        errors.append(f"{source_location} must be relative")
-                    if any(part in {".", ".."} for part in Path(source).parts):
-                        errors.append(f"{source_location} must be normalized")
-                    if source in seen_sources:
-                        errors.append(f"{source_location} duplicate={source!r}")
-                    seen_sources.add(source)
-                    normalized_sources.append(source)
+                for signal_index, signal in enumerate(signal_values):
+                    signal_location = f"{location}.signals[{signal_index}]"
+                    if not isinstance(signal, str) or not signal:
+                        errors.append(f"{signal_location} must be a non-empty string")
+                    elif signal not in signal_ids:
+                        errors.append(f"{signal_location} unknown={signal!r}")
+                    elif signal in signals:
+                        errors.append(f"{signal_location} duplicate={signal!r}")
+                    else:
+                        signals.append(signal)
 
             if surface_id is not None:
                 surface_order.append(surface_id)
                 surfaces[surface_id] = {
                     "id": surface_id,
                     "boundary": boundary,
-                    "source_kind": source_kind,
-                    "sources": normalized_sources,
+                    "base_source": base_source,
+                    "agent_source": agent_source,
+                    "signals": signals,
                     "probes": [],
                 }
+
+    missing_surfaces = set(expected_surfaces) - set(surfaces)
+    extra_surfaces = set(surfaces) - set(expected_surfaces)
+    if missing_surfaces:
+        errors.append(f"missing_executable_surfaces={sorted(missing_surfaces)!r}")
+    if extra_surfaces:
+        errors.append(f"unknown_executable_surfaces={sorted(extra_surfaces)!r}")
 
     probes_value = document.get("probes")
     probes: list[dict[str, Any]] = []
@@ -758,75 +815,35 @@ def _permission_source_path(
     return path, "ok", None
 
 
-def _permission_expected_sources(
-    profile: str,
-    documents: Mapping[str, Mapping[str, Any]],
-) -> dict[str, tuple[str, str]]:
-    """Return the profile-owned permission sources that cannot be omitted."""
-    prefix = "agents" if profile == "global" else ".opencode/agents"
-    assignments = documents.get(profile, {}).get("assignments", {})
-    expected = {"opencode.json": ("json", "parent")}
-    if isinstance(assignments, Mapping):
-        expected.update(
-            {
-                f"{prefix}/{role}.md": (
-                    "agent-frontmatter",
-                    "parent"
-                    if profile == "agent-core" and role == "task-orchestrator"
-                    else "leaf",
-                )
-                for role in assignments
-                if isinstance(role, str) and role
-            }
-        )
-    return expected
-
-
 def _permission_source_inventory_errors(
     profile: str,
     agent_dir: Path,
     documents: Mapping[str, Mapping[str, Any]],
     surfaces: list[dict[str, Any]],
 ) -> list[str]:
-    """Require all canonical profile-owned JSON and role frontmatter sources."""
-    expected = _permission_expected_sources(profile, documents)
-    declared: dict[str, tuple[str, str]] = {}
-    for surface in surfaces:
-        for source in surface["sources"]:
-            declared[source] = (surface["source_kind"], surface["boundary"])
-
+    """Require each manifest surface to bind a canonical executable agent."""
+    expected = _permission_expected_surfaces(profile, documents)
+    declared = {surface["id"]: surface for surface in surfaces}
     errors: list[str] = []
-    for source, (source_kind, boundary) in expected.items():
-        actual = declared.get(source)
-        if actual is None:
-            errors.append(f"missing_declared_source={source}")
-        elif actual[0] != source_kind:
-            errors.append(
-                f"source_kind_mismatch={source}:actual={actual[0]}:expected={source_kind}"
-            )
-        elif actual[1] != boundary:
-            errors.append(
-                f"source_boundary_mismatch={source}:actual={actual[1]}:expected={boundary}"
-            )
-
-    prefix = "agents" if profile == "global" else ".opencode/agents"
-    for source, (source_kind, boundary) in declared.items():
-        if source in expected:
+    for role, (boundary, agent_source) in expected.items():
+        surface = declared.get(role)
+        if surface is None:
+            errors.append(f"missing_executable_surface={role}")
             continue
-        # Additional consumer-owned agents remain supported, but they must be
-        # real files in the selected agent inventory. In particular, an
-        # arbitrary benign file cannot satisfy a required leaf surface.
-        if source_kind != "agent-frontmatter" or boundary != "leaf":
-            errors.append(f"undeclared_source={source}")
-            continue
-        relative_agent = Path(source)
-        if (
-            not source.startswith(f"{prefix}/")
-            or relative_agent.suffix != ".md"
-            or not (agent_dir / relative_agent.relative_to(prefix)).is_file()
-            or (agent_dir / relative_agent.relative_to(prefix)).is_symlink()
-        ):
-            errors.append(f"undeclared_source={source}")
+        if surface["boundary"] != boundary:
+            errors.append(
+                f"surface_boundary_mismatch={role}:actual={surface['boundary']}:expected={boundary}"
+            )
+        if surface["base_source"] != "opencode.json":
+            errors.append(
+                f"surface_base_source_mismatch={role}:actual={surface['base_source']!r}:"
+                "expected='opencode.json'"
+            )
+        if surface["agent_source"] != agent_source:
+            errors.append(
+                f"surface_agent_source_mismatch={role}:actual={surface['agent_source']!r}:"
+                f"expected={agent_source!r}"
+            )
     return errors
 
 
@@ -887,22 +904,24 @@ def _permission_value_error(value: Any) -> str | None:
 
 
 def _permission_effective_action(
-    value: Any,
+    base_value: Any,
+    agent_value: Any,
     tool: str,
     input_value: str,
-    inherited: tuple[Any, ...] = (),
-) -> str:
-    """Evaluate ordered OpenCode rules, including inherited config layers."""
+) -> tuple[str | None, bool]:
+    """Evaluate one executable agent's ordered permission layers."""
     # OpenCode flattens each configured layer in insertion order, merges the
     # layers, and applies the last rule matching both permission and input.
     # This matters when a broad permission key such as "*" appears after a
     # tool-specific rule, or when an agent overrides the project map.
-    effective = "ask"
-    for layer in (*inherited, value):
+    effective: str | None = None
+    matched = False
+    for layer in (base_value, agent_value):
         if layer is _PERMISSION_MISSING:
             continue
         if isinstance(layer, str):
             effective = layer
+            matched = True
             continue
         if not isinstance(layer, Mapping):
             continue
@@ -911,20 +930,21 @@ def _permission_effective_action(
                 continue
             if isinstance(configured, str):
                 effective = configured
+                matched = True
                 continue
             if not isinstance(configured, Mapping):
                 continue
             for input_pattern, action in configured.items():
                 if _permission_wildcard_match(input_pattern, input_value):
                     effective = action
-    return effective
+                    matched = True
+    return effective, matched
 
 
 def _permission_observation_line(
     status: str,
     profile: str,
     surface: Mapping[str, Any],
-    source: str,
     probe: Mapping[str, Any],
     authority: str,
     expected: str,
@@ -935,8 +955,10 @@ def _permission_observation_line(
     classes = ",".join(probe["classes"])
     input_digest = hashlib.sha256(probe["input"].encode("utf-8")).hexdigest()
     line = (
-        f"{status} profile={profile} surface={surface['id']} source={source} "
+        f"{status} profile={profile} surface={surface['id']} "
+        f"base_source={surface['base_source']} agent_source={surface['agent_source']} "
         f"classes={classes} boundary={surface['boundary']} authority={authority} "
+        f"signals={','.join(surface['signals'])} "
         f"expected={expected} actual={actual} input_sha256={input_digest} "
         f"expected_escalation={expected_escalation}"
     )
@@ -1020,16 +1042,37 @@ def _audit_permission_contract(
         counts["DIFF"] += 1
         return lines, counts
 
+    expected_surfaces = _permission_expected_surfaces(profile, documents)
     surfaces, _probes, manifest_errors = _permission_manifest_schema(
         manifest_document,
         profile,
         context["classes"],
+        expected_surfaces,
+        context["signals"],
     )
     if manifest_errors:
         reason = ";".join(manifest_errors)
         lines.append(
             f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
             f"reason=manifest_schema_invalid={reason}"
+        )
+        counts["DIFF"] += 1
+        return lines, counts
+
+    signal_errors: list[str] = []
+    for surface in surfaces:
+        for class_id in context["classes"]:
+            escalation = context["operations"][class_id][
+                f"{surface['boundary']}_escalation"
+            ]
+            if escalation in context["signals"] and escalation not in surface["signals"]:
+                signal_errors.append(
+                    f"surface={surface['id']!r} missing_signal={escalation!r}"
+                )
+    if signal_errors:
+        lines.append(
+            f"DIFF UNEXPECTED_DRIFT profile={profile} permission_manifest={manifest} "
+            "reason=manifest_signal_invalid=" + ";".join(signal_errors)
         )
         counts["DIFF"] += 1
         return lines, counts
@@ -1049,43 +1092,42 @@ def _audit_permission_contract(
         counts["DIFF"] += 1
         return lines, counts
 
-    source_results: dict[str, tuple[str, Any, str | None]] = {}
+    source_specs: dict[str, str] = {"opencode.json": "json"}
     for surface in surfaces:
-        for source in surface["sources"]:
-            if source in source_results:
-                continue
-            source_path, source_status, source_reason = _permission_source_path(
-                bundle_dir,
+        source_specs[surface["agent_source"]] = "agent-frontmatter"
+    source_results: dict[str, tuple[str, Any, str | None]] = {}
+    for source, source_kind in source_specs.items():
+        source_path, source_status, source_reason = _permission_source_path(
+            bundle_dir,
+            consumer_root,
+            source,
+        )
+        if source_status == "ok" and source_path is not None:
+            permission_value, parse_reason, read_status = _permission_read_source(
+                source_path,
                 consumer_root,
-                source,
-                )
-            if source_status == "ok" and source_path is not None:
-                permission_value, parse_reason, read_status = _permission_read_source(
-                    source_path,
-                    consumer_root,
-                    surface["source_kind"],
-                )
-                if parse_reason:
-                    source_results[source] = (
-                        "missing" if read_status == "missing" else "error",
-                        _PERMISSION_MISSING,
-                        parse_reason,
-                    )
-                else:
-                    value_reason = _permission_value_error(permission_value)
-                    source_results[source] = (
-                        "error" if value_reason else "ok",
-                        permission_value,
-                        value_reason,
-                    )
-            else:
+                source_kind,
+            )
+            if parse_reason:
                 source_results[source] = (
-                    source_status,
+                    "missing" if read_status == "missing" else "error",
                     _PERMISSION_MISSING,
-                    source_reason,
+                    parse_reason,
                 )
+            else:
+                value_reason = _permission_value_error(permission_value)
+                source_results[source] = (
+                    "error" if value_reason else "ok",
+                    permission_value,
+                    value_reason,
+                )
+        else:
+            source_results[source] = (
+                source_status,
+                _PERMISSION_MISSING,
+                source_reason,
+            )
 
-    base_result = source_results.get("opencode.json")
     for surface in surfaces:
         boundary = surface["boundary"]
         authority = context["authorities"][boundary]
@@ -1107,72 +1149,90 @@ def _audit_permission_contract(
                 key=escalation_rank.__getitem__,
             )
 
-            for source in surface["sources"]:
-                source_status, permission_value, source_reason = source_results[source]
-                inherited: tuple[Any, ...] = ()
-                if surface["source_kind"] == "agent-frontmatter" and base_result is not None:
-                    base_status, base_value, base_reason = base_result
-                    if base_status == "ok":
-                        inherited = (base_value,)
-                    elif source_status == "ok":
-                        source_status = "error"
-                        source_reason = f"inherited_opencode_json={base_reason or base_status}"
-                if source_status == "ok":
-                    actual = _permission_effective_action(
-                        permission_value,
-                        probe["tool"],
-                        probe["input"],
-                        inherited,
+            base_status, base_value, base_reason = source_results[surface["base_source"]]
+            agent_status, agent_value, agent_reason = source_results[surface["agent_source"]]
+            if base_status != "ok" or agent_status != "ok":
+                source_status = (
+                    "missing"
+                    if "missing" in {base_status, agent_status}
+                    else "error"
+                )
+                source_reason = ";".join(
+                    reason
+                    for reason in (
+                        f"base_source={base_reason}" if base_reason else None,
+                        f"agent_source={agent_reason}" if agent_reason else None,
                     )
-                    if actual == expected:
-                        lines.append(
-                            _permission_observation_line(
-                                "PASS",
-                                profile,
-                                surface,
-                                source,
-                                probe,
-                                authority,
-                                expected,
-                                actual,
-                                expected_escalation,
-                            )
-                        )
-                        counts["PASS"] += 1
-                    else:
-                        lines.append(
-                            _permission_observation_line(
-                                "DIFF UNEXPECTED_DRIFT",
-                                profile,
-                                surface,
-                                source,
-                                probe,
-                                authority,
-                                expected,
-                                actual,
-                                expected_escalation,
-                                "permission_action_mismatch",
-                            )
-                        )
-                        counts["DIFF"] += 1
-                else:
-                    status = "MISSING UNEXPECTED_DRIFT" if source_status == "missing" else "DIFF UNEXPECTED_DRIFT"
-                    actual = "unavailable" if source_status == "missing" else "invalid_source"
-                    lines.append(
-                        _permission_observation_line(
-                            status,
-                            profile,
-                            surface,
-                            source,
-                            probe,
-                            authority,
-                            expected,
-                            actual,
-                            expected_escalation,
-                            source_reason,
-                        )
+                    if reason
+                )
+                status = "MISSING UNEXPECTED_DRIFT" if source_status == "missing" else "DIFF UNEXPECTED_DRIFT"
+                actual = "unavailable" if source_status == "missing" else "invalid_source"
+                lines.append(
+                    _permission_observation_line(
+                        status,
+                        profile,
+                        surface,
+                        probe,
+                        authority,
+                        expected,
+                        actual,
+                        expected_escalation,
+                        source_reason,
                     )
-                    counts["MISSING" if source_status == "missing" else "DIFF"] += 1
+                )
+                counts["MISSING" if source_status == "missing" else "DIFF"] += 1
+                continue
+
+            actual, matched = _permission_effective_action(
+                base_value,
+                agent_value,
+                probe["tool"],
+                probe["input"],
+            )
+            if not matched:
+                lines.append(
+                    _permission_observation_line(
+                        "DIFF UNEXPECTED_DRIFT",
+                        profile,
+                        surface,
+                        probe,
+                        authority,
+                        expected,
+                        "unproven",
+                        expected_escalation,
+                        "implicit_default",
+                    )
+                )
+                counts["DIFF"] += 1
+            elif actual == expected:
+                lines.append(
+                    _permission_observation_line(
+                        "PASS",
+                        profile,
+                        surface,
+                        probe,
+                        authority,
+                        expected,
+                        actual,
+                        expected_escalation,
+                    )
+                )
+                counts["PASS"] += 1
+            else:
+                lines.append(
+                    _permission_observation_line(
+                        "DIFF UNEXPECTED_DRIFT",
+                        profile,
+                        surface,
+                        probe,
+                        authority,
+                        expected,
+                        actual,
+                        expected_escalation,
+                        "permission_action_mismatch",
+                    )
+                )
+                counts["DIFF"] += 1
     return lines, counts
 
 

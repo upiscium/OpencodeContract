@@ -60,12 +60,19 @@ class PackagedGlobalPathTests(unittest.TestCase):
 
         models = self.documents["models"]["models"]
         roles = self.documents["roles"]["roles"]
+        surface_policy = self.documents["global"]["permission_surfaces"]
+        parent_roles = set(surface_policy["parent_roles"])
         for role, assignment in self.documents["global"]["assignments"].items():
             mode = roles[role]["kind"]
             model = models[assignment["primary_model"]]["id"]
+            role_permissions = (
+                PARENT_BASH_PERMISSIONS
+                if role in parent_roles
+                else LEAF_BASH_PERMISSIONS
+            )
             permission_lines = "\n".join(
                 f"    {json.dumps(pattern)}: {action}"
-                for pattern, action in LEAF_BASH_PERMISSIONS.items()
+                for pattern, action in role_permissions.items()
             )
             (agent_dir / f"{role}.md").write_text(
                 f"---\nmode: {mode}\nmodel: {model}\n"
@@ -77,29 +84,28 @@ class PackagedGlobalPathTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        surface_roles = [
+            (role, "parent") for role in surface_policy["parent_roles"]
+        ] + [
+            (role, "leaf") for role in surface_policy["leaf_roles"]
+        ]
         manifest_lines = [
             "schema_version = 1",
             'contract = "permission-semantics"',
             'profile = "global"',
-            "",
-            "[[surfaces]]",
-            'id = "parent"',
-            'boundary = "parent"',
-            'source_kind = "json"',
-            'sources = ["opencode.json"]',
-            "",
-            "[[surfaces]]",
-            'id = "leaf"',
-            'boundary = "leaf"',
-            'source_kind = "agent-frontmatter"',
-            "sources = ["
-            + ", ".join(
-                json.dumps(f"agents/{role}.md")
-                for role in self.documents["global"]["assignments"]
-            )
-            + "]",
         ]
-        for surface in ("parent", "leaf"):
+        for surface, boundary in surface_roles:
+            manifest_lines.extend(
+                [
+                    "",
+                    "[[surfaces]]",
+                    f'id = "{surface}"',
+                    f'boundary = "{boundary}"',
+                    'base_source = "opencode.json"',
+                    f'agent_source = "agents/{surface}.md"',
+                    'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
+                ]
+            )
             for input_value, class_id in PERMISSION_PROBES:
                 manifest_lines.extend(
                     [

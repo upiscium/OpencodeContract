@@ -77,12 +77,14 @@ class PolicyContractTests(unittest.TestCase):
             ("agent-core", templates_bundle, templates_agents),
         ):
             assignments = self.docs[profile]["assignments"]
+            surface_policy = self.docs[profile]["permission_surfaces"]
+            parent_roles = set(surface_policy["parent_roles"])
             for role, assignment in assignments.items():
                 mode = roles[role]["kind"]
                 model = models[assignment["primary_model"]]["id"]
                 role_permissions = (
                     PARENT_BASH_PERMISSIONS
-                    if profile == "agent-core" and role == "task-orchestrator"
+                    if role in parent_roles
                     else LEAF_BASH_PERMISSIONS
                 )
                 permission_lines = "\n".join(
@@ -100,33 +102,29 @@ class PolicyContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             source_prefix = "agents" if profile == "global" else ".opencode/agents"
-            surface_sources = [("parent", "parent", "json", ["opencode.json"])]
-            surface_sources.extend(
-                (
-                    role,
-                    "parent" if profile == "agent-core" and role == "task-orchestrator" else "leaf",
-                    "agent-frontmatter",
-                    [f"{source_prefix}/{role}.md"],
-                )
-                for role in assignments
-            )
+            surface_roles = [
+                (role, "parent") for role in surface_policy["parent_roles"]
+            ] + [
+                (role, "leaf") for role in surface_policy["leaf_roles"]
+            ]
             manifest_lines = [
                 "schema_version = 1",
                 'contract = "permission-semantics"',
                 f'profile = "{profile}"',
             ]
-            for surface_id, boundary, source_kind, sources in surface_sources:
+            for surface_id, boundary in surface_roles:
                 manifest_lines.extend(
                     [
                         "",
                         "[[surfaces]]",
                         f'id = "{surface_id}"',
                         f'boundary = "{boundary}"',
-                        f'source_kind = "{source_kind}"',
-                        f"sources = [{', '.join(json.dumps(source) for source in sources)}]",
+                        'base_source = "opencode.json"',
+                        f'agent_source = "{source_prefix}/{surface_id}.md"',
+                        'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
                     ]
                 )
-            for surface_id, _, _, _ in surface_sources:
+            for surface_id, _ in surface_roles:
                 for input_value, class_id in PERMISSION_PROBES:
                     manifest_lines.extend(
                         [
@@ -710,6 +708,23 @@ class PolicyContractTests(unittest.TestCase):
         self.assertEqual(["agent-core"], task_orchestrator["profiles"])
         self.assertNotIn("task-orchestrator", self.docs["global"]["assignments"])
 
+    def test_permission_surface_mapping_binds_only_executable_authorities(self) -> None:
+        self.assertEqual(
+            ["build"],
+            self.docs["global"]["permission_surfaces"]["parent_roles"],
+        )
+        self.assertEqual(
+            ["task-orchestrator"],
+            self.docs["agent-core"]["permission_surfaces"]["parent_roles"],
+        )
+        for profile in ("global", "agent-core"):
+            surface_roles = {
+                *self.docs[profile]["permission_surfaces"]["parent_roles"],
+                *self.docs[profile]["permission_surfaces"]["leaf_roles"],
+            }
+            self.assertNotIn("plan", surface_roles)
+            self.assertTrue(surface_roles <= set(self.docs[profile]["assignments"]))
+
     def test_quota_family_is_defined_once_per_model(self) -> None:
         families = self.docs["models"]["quota_families"]
         for model in self.docs["models"]["models"].values():
@@ -769,7 +784,10 @@ class PolicyContractTests(unittest.TestCase):
                     lines, counts = audit_profile(profile, consumer, self.docs)
                     self.assertEqual(0, counts["DIFF"], lines)
                     self.assertEqual(0, counts["MISSING"], lines)
-                    surfaces = ["parent", *self.docs[profile]["assignments"]]
+                    surfaces = [
+                        *self.docs[profile]["permission_surfaces"]["parent_roles"],
+                        *self.docs[profile]["permission_surfaces"]["leaf_roles"],
+                    ]
                     for surface in surfaces:
                         observed = {
                             class_id
@@ -876,7 +894,7 @@ class PolicyContractTests(unittest.TestCase):
             (dotnix_agents / "build.md").unlink()
             (templates_agents / "build.md").unlink()
             _, counts = audit(dotnix, templates, ROOT)
-            self.assertEqual(14, counts["MISSING"])
+            self.assertEqual(8, counts["MISSING"])
 
     def test_model_availability_contract_is_accepted(self) -> None:
         availability = self.docs["model-availability"]["policy"]

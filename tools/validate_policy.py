@@ -750,6 +750,46 @@ def validate_policy(root: Path = ROOT) -> list[str]:
         if extra:
             errors.append(f"profiles/{profile_id}.toml: inapplicable role assignments {sorted(extra)}")
 
+        permission_surfaces = profile_doc.get("permission_surfaces")
+        if not isinstance(permission_surfaces, dict):
+            errors.append(
+                f"profiles/{profile_id}.toml: permission_surfaces must be a table"
+            )
+            permission_surfaces = {}
+        unknown_surface_fields = set(permission_surfaces) - {"parent_roles", "leaf_roles"}
+        if unknown_surface_fields:
+            errors.append(
+                f"profiles/{profile_id}.toml permission_surfaces: unsupported fields "
+                f"{sorted(unknown_surface_fields)}"
+            )
+        parent_roles = permission_surfaces.get("parent_roles")
+        leaf_roles = permission_surfaces.get("leaf_roles")
+        for field, role_values in (("parent_roles", parent_roles), ("leaf_roles", leaf_roles)):
+            if (
+                not isinstance(role_values, list)
+                or not role_values
+                or any(not isinstance(role_id, str) or not role_id for role_id in role_values)
+                or len(role_values) != len(set(role_values))
+            ):
+                errors.append(
+                    f"profiles/{profile_id}.toml permission_surfaces.{field}: "
+                    "must be a non-empty list of unique role IDs"
+                )
+        if isinstance(parent_roles, list) and isinstance(leaf_roles, list):
+            overlap = set(parent_roles) & set(leaf_roles)
+            if overlap:
+                errors.append(
+                    f"profiles/{profile_id}.toml permission_surfaces: role in both "
+                    f"boundaries {sorted(overlap)}"
+                )
+            for boundary, role_values in (("parent", parent_roles), ("leaf", leaf_roles)):
+                for role_id in role_values:
+                    if role_id not in assignments[profile_id]:
+                        errors.append(
+                            f"profiles/{profile_id}.toml permission_surfaces.{boundary}_roles: "
+                            f"role {role_id!r} is not an assignment"
+                        )
+
     availability_doc = docs["model-availability"]
     unknown_availability_sections = set(availability_doc) - {"schema_version", "policy"}
     if unknown_availability_sections:

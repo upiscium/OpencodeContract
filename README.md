@@ -195,8 +195,8 @@ contract.
 
 The manifest has a closed schema. Its only top-level keys are
 `schema_version`, `contract`, `profile`, `surfaces`, and `probes`. Each surface
-has exactly `id`, `boundary`, `source_kind`, and `sources`; each probe has
-exactly `surface`, `tool`, `input`, and `classes`.
+has exactly `id`, `boundary`, `base_source`, `agent_source`, and `signals`; each
+probe has exactly `surface`, `tool`, `input`, and `classes`.
 
 ```toml
 schema_version = 1
@@ -204,10 +204,11 @@ contract = "permission-semantics"
 profile = "<global-or-agent-core>"
 
 [[surfaces]]
-id = "<surface-id>"
+id = "<canonical-role-id>"
 boundary = "<parent-or-leaf>"
-source_kind = "<json-or-agent-frontmatter>"
-sources = ["<relative-source>"]
+base_source = "opencode.json"
+agent_source = "<relative-agent-source>"
+signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]
 
 [[probes]]
 surface = "<surface-id>"
@@ -216,24 +217,38 @@ input = "<consumer-owned-input>"
 classes = ["<canonical-class-id>"]
 ```
 
-The manifest declares semantic class coverage, not expected results. Expected
-dispositions and escalation outcomes are derived from the canonical policy for
-the selected profile, boundary, and classes; they are not declared in the
-manifest. Consumers own the concrete probe inputs, complete permission maps,
-and OpenCode permission-pattern spelling. The auditor reads the actual
-permission maps from declared JSON and agent-frontmatter sources. It preserves
-OpenCode's ordered last-match wildcard semantics, so a stronger `deny`
-overlap remains effective and is detected rather than hidden by an earlier
-`allow` or `ask` pattern. Permission differences unrelated to a declared
-probe are allowed, but the manifest must include the selected bundle's
-`opencode.json` and every canonical profile-role agent source; those sources
-cannot be omitted or substituted with a benign file. Agent-frontmatter probes
-are evaluated after the bundle JSON permission layer, matching OpenCode's
-agent-overrides-global merge order. Audit diagnostics identify probe inputs by
-SHA-256 rather than printing consumer-owned input text. The bundle JSON is the
-parent surface; canonical agent frontmatter is the leaf surface, except for
-the Agent-Core `task-orchestrator` parent surface. Additional declared agent
-sources must be real files in the selected agent inventory.
+The manifest declares executable agent surfaces and semantic class coverage,
+not expected results. A surface is the effective stack of its `base_source`
+and `agent_source`; the base JSON is never an independently executable parent
+surface. OpenCode's ordered last-match behavior is evaluated through the base
+layer first and the agent layer second, so an agent override is effective and
+later concrete rules override earlier wildcards. If no explicit rule matches a
+probe, the result is `unproven` and strict conformance fails; the audit never
+guesses a mutable OpenCode default such as `ask`.
+
+The canonical profile policy binds the required executable authority surfaces:
+Global `build` is the approval-capable `parent`; Global subagents are `leaf`
+surfaces. Agent-Core `task-orchestrator` is the approval-capable `parent`; its
+depth-2 implementation and read-only agents are `leaf` surfaces. Roles such as
+`plan` that are not part of this permission boundary are not invented as
+semantic surfaces merely because their agent files exist. Surface IDs, source
+paths, and boundaries must match those canonical mappings, so a standalone
+JSON entry or benign file cannot satisfy an authority boundary.
+
+`signals` is a bounded consumer-owned declaration of supported outcome
+semantics. Canonical signal names are validated against
+`permission-semantics.toml`; a leaf surface participating in the local-delete
+contract must declare `NEEDS_APPROVAL`, while the surface's `parent` boundary
+declares the approval-capable authority. The manifest does not duplicate the
+canonical class-to-signal table or prompt wording. This is static declaration
+conformance only: it does not prove that an LLM follows a prompt, emits the
+signal at runtime, or supplies the required evidence.
+
+Consumers own the concrete probe inputs, complete permission maps, and
+OpenCode permission-pattern spelling. Permission differences unrelated to a
+declared probe are allowed. Audit diagnostics identify probe inputs by SHA-256
+rather than printing consumer-owned input text. The selected profile-owned
+agent sources must be real confined files.
 
 The check is static declared-probe conformance, not proof of runtime behavior.
 Missing manifests or sources report `MISSING UNEXPECTED_DRIFT`; malformed

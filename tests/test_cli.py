@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -83,11 +83,13 @@ class ConsumerAuditCliTest(unittest.TestCase):
         models = self.documents["models"]["models"]
         roles = self.documents["roles"]["roles"]
         assignments = self.documents[profile]["assignments"]
+        surface_policy = self.documents[profile]["permission_surfaces"]
+        parent_roles = set(surface_policy["parent_roles"])
         for role, assignment in assignments.items():
             mode = roles[role]["kind"]
             role_permissions = (
                 PARENT_BASH_PERMISSIONS
-                if profile == "agent-core" and role == "task-orchestrator"
+                if role in parent_roles
                 else LEAF_BASH_PERMISSIONS
             )
             model = models[assignment["primary_model"]]["id"]
@@ -106,33 +108,29 @@ class ConsumerAuditCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         source_prefix = "agents" if profile == "global" else ".opencode/agents"
-        surface_sources = [("parent", "parent", "json", ["opencode.json"])]
-        surface_sources.extend(
-            (
-                role,
-                "parent" if profile == "agent-core" and role == "task-orchestrator" else "leaf",
-                "agent-frontmatter",
-                [f"{source_prefix}/{role}.md"],
-            )
-            for role in assignments
-        )
+        surface_roles = [
+            (role, "parent") for role in surface_policy["parent_roles"]
+        ] + [
+            (role, "leaf") for role in surface_policy["leaf_roles"]
+        ]
         manifest_lines = [
             "schema_version = 1",
             'contract = "permission-semantics"',
             f'profile = "{profile}"',
         ]
-        for surface_id, boundary, source_kind, sources in surface_sources:
+        for surface_id, boundary in surface_roles:
             manifest_lines.extend(
                 [
                     "",
                     "[[surfaces]]",
                     f'id = "{surface_id}"',
                     f'boundary = "{boundary}"',
-                    f'source_kind = "{source_kind}"',
-                    f"sources = [{', '.join(json.dumps(source) for source in sources)}]",
+                    'base_source = "opencode.json"',
+                    f'agent_source = "{source_prefix}/{surface_id}.md"',
+                    'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
                 ]
             )
-        for surface_id, _, _, _ in surface_sources:
+        for surface_id, _ in surface_roles:
             for input_value, class_id in PERMISSION_PROBES:
                 manifest_lines.extend(
                     [
@@ -287,7 +285,10 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 lines, counts = audit_profile(profile, consumer, self.documents)
                 self.assertEqual(0, counts["DIFF"], lines)
                 self.assertEqual(0, counts["MISSING"], lines)
-                surfaces = ["parent", *self.documents[profile]["assignments"]]
+                surfaces = [
+                    *self.documents[profile]["permission_surfaces"]["parent_roles"],
+                    *self.documents[profile]["permission_surfaces"]["leaf_roles"],
+                ]
                 for surface in surfaces:
                     observed = {
                         class_id
@@ -300,14 +301,15 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                     }
                     self.assertEqual(set(PERMISSION_CLASSES), observed, surface)
                 source = (
-                    "agents/plan.md"
+                    "agents/general.md"
                     if profile == "global"
-                    else ".opencode/agents/plan.md"
+                    else ".opencode/agents/general.md"
                 )
                 self.assertTrue(
                     any(
                         line.startswith(
-                            f"PASS profile={profile} surface=plan source={source}"
+                            f"PASS profile={profile} surface=general "
+                            f"base_source=opencode.json agent_source={source}"
                         )
                         and "classes=local-filesystem-delete" in line
                         and "actual=deny" in line
@@ -345,7 +347,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             ),
             (
                 "unknown surface field",
-                'boundary = "parent"\nextra = true\n',
+                    'boundary = "parent"\nextra = true\n',
                 "surfaces[0] unknown fields",
             ),
             (
@@ -394,19 +396,19 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             (
                 "dangling surface",
                 lambda contents: contents.replace(
-                    'surface = "parent"', 'surface = "orphan"', 1
+                    'surface = "build"', 'surface = "orphan"', 1
                 ),
                 "dangling='orphan'",
             ),
             (
                 "missing class coverage",
                 lambda contents: contents.replace(
-                    '[[probes]]\nsurface = "parent"\ntool = "bash"\n'
+                    '[[probes]]\nsurface = "build"\ntool = "bash"\n'
                     'input = "git status"\nclasses = ["safe-read-only"]\n\n',
                     "",
                     1,
                 ),
-                "surface='parent' missing_coverage",
+                "surface='build' missing_coverage",
             ),
         )
         for label, mutate, reason in variants:
@@ -424,20 +426,20 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             (
                 "boundary swap",
                 lambda contents: contents.replace(
-                    'id = "build"\nboundary = "leaf"',
                     'id = "build"\nboundary = "parent"',
+                    'id = "build"\nboundary = "leaf"',
                     1,
                 ),
-                "source_boundary_mismatch=agents/build.md",
+                "missing_boundary_surface=parent",
             ),
             (
                 "benign source",
                 lambda contents: contents.replace(
-                    'sources = ["opencode.json"]',
-                    'sources = ["agents/benign.md"]',
+                    'base_source = "opencode.json"',
+                    'base_source = "agents/benign.md"',
                     1,
                 ),
-                "missing_declared_source=opencode.json",
+                "surface_base_source_mismatch=build",
             ),
         )
         for label, mutate, reason in variants:
@@ -461,7 +463,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             )
             contents += (
                 "\n[[probes]]\n"
-                'surface = "parent"\n'
+                'surface = "build"\n'
                 'tool = "bash"\n'
                 f'input = "{secret}"\n'
                 'classes = ["safe-read-only"]\n'
@@ -495,7 +497,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             self.assertTrue(any("reason=manifest_not_regular" in line for line in lines), lines)
 
     def test_permission_sources_missing_invalid_symlink_and_utf8_fail_closed(self) -> None:
-        source = "agents/plan.md"
+        source = "agents/general.md"
         missing_variants = (
             ("missing", source, "source_missing"),
             ("invalid", source, "source_parse_error"),
@@ -533,15 +535,16 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
         for action in ("deny", "allow"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
                 consumer = self.make_consumer(Path(temporary), "global")
-                config_path = consumer / "config.d/opencode/opencode.json"
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-                config["permission"]["bash"]["rm*"] = action
-                config_path.write_text(json.dumps(config), encoding="utf-8")
+                agent = consumer / "config.d/opencode/agents/build.md"
+                contents = agent.read_text(encoding="utf-8").replace(
+                    '    "rm*": ask', f'    "rm*": {action}', 1
+                )
+                agent.write_text(contents, encoding="utf-8")
                 lines, counts = audit_profile("global", consumer, self.documents)
                 self.assertEqual(1, counts["DIFF"], lines)
                 self.assertTrue(
                     any(
-                        "surface=parent" in line
+                        "surface=build" in line
                         and "expected=ask" in line
                         and f"actual={action}" in line
                         for line in lines
@@ -549,11 +552,111 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                     lines,
                 )
 
+    def test_global_build_effective_parent_uses_agent_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(0, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=build" in line
+                    and "boundary=parent" in line
+                    and "classes=local-filesystem-delete" in line
+                    and "expected=ask actual=ask" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+    def test_base_permission_layer_is_inherited_when_agent_has_no_match(self) -> None:
+        cases = (
+            ("global", "config.d/opencode/agents/build.md", "build"),
+            (
+                "agent-core",
+                "components/agent-core/.opencode/agents/task-orchestrator.md",
+                "task-orchestrator",
+            ),
+        )
+        for profile, relative_agent, surface in cases:
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), profile)
+                bundle = (
+                    consumer / "config.d/opencode"
+                    if profile == "global"
+                    else consumer / "components/agent-core"
+                )
+                config_path = bundle / "opencode.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["permission"]["bash"].pop("*", None)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                agent = consumer / relative_agent
+                contents = agent.read_text(encoding="utf-8")
+                contents = contents.replace('    "*": ask\n', "", 1)
+                agent.write_text(contents, encoding="utf-8")
+                lines, counts = audit_profile(profile, consumer, self.documents)
+                self.assertEqual(0, counts["DIFF"], lines)
+                self.assertTrue(
+                    any(
+                        f"surface={surface}" in line
+                        and "classes=local-filesystem-delete" in line
+                        and "expected=ask actual=ask" in line
+                        for line in lines
+                    ),
+                    lines,
+                )
+
+    def test_global_parent_cannot_be_satisfied_by_standalone_json_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            contents = manifest.read_text(encoding="utf-8").replace(
+                'id = "build"', 'id = "parent"', 1
+            )
+            manifest.write_text(contents, encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(any("missing_executable_surfaces=['build']" in line for line in lines), lines)
+
+    def test_global_build_declared_leaf_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            contents = manifest.read_text(encoding="utf-8").replace(
+                'id = "build"\nboundary = "parent"',
+                'id = "build"\nboundary = "leaf"',
+                1,
+            )
+            manifest.write_text(contents, encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(any("missing_boundary_surface=parent" in line for line in lines), lines)
+
+    def test_global_build_override_to_deny_fails_parent_conformance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            agent = consumer / "config.d/opencode/agents/build.md"
+            agent.write_text(
+                agent.read_text(encoding="utf-8").replace(
+                    '    "rm*": ask', '    "rm*": deny', 1
+                ),
+                encoding="utf-8",
+            )
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=build" in line
+                    and "expected=ask actual=deny" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
     def test_leaf_local_delete_allow_or_ask_is_not_conforming(self) -> None:
         for action in ("allow", "ask"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
                 consumer = self.make_consumer(Path(temporary), "global")
-                agent = consumer / "config.d/opencode/agents/plan.md"
+                agent = consumer / "config.d/opencode/agents/general.md"
                 contents = agent.read_text(encoding="utf-8").replace(
                     '    "rm*": deny', f'    "rm*": {action}', 1
                 )
@@ -562,13 +665,118 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 self.assertEqual(1, counts["DIFF"], lines)
                 self.assertTrue(
                     any(
-                        "surface=plan" in line
+                        "surface=general" in line
                         and "expected=deny" in line
                         and f"actual={action}" in line
                         for line in lines
                     ),
                     lines,
                 )
+
+    def test_agent_core_task_orchestrator_effective_parent_and_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "agent-core")
+            lines, counts = audit_profile("agent-core", consumer, self.documents)
+            self.assertEqual(0, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=task-orchestrator" in line
+                    and "boundary=parent" in line
+                    and "classes=local-filesystem-delete" in line
+                    and "expected=ask actual=ask" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+            agent = consumer / "components/agent-core/.opencode/agents/task-orchestrator.md"
+            agent.write_text(
+                agent.read_text(encoding="utf-8").replace(
+                    '    "rm*": ask', '    "rm*": deny', 1
+                ),
+                encoding="utf-8",
+            )
+            lines, counts = audit_profile("agent-core", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=task-orchestrator" in line
+                    and "expected=ask actual=deny" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+    def test_leaf_effective_delete_is_deny(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "agent-core")
+            lines, counts = audit_profile("agent-core", consumer, self.documents)
+            self.assertEqual(0, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=general" in line
+                    and "boundary=leaf" in line
+                    and "classes=local-filesystem-delete" in line
+                    and "expected=deny actual=deny" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+    def test_unmatched_effective_permission_fails_closed(self) -> None:
+        cases = (
+            ("global", "build", "rm*", "ask"),
+            ("agent-core", "general", "git reset --hard*", "deny"),
+        )
+        for profile, role, pattern, expected_action in cases:
+            with self.subTest(profile=profile, role=role), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), profile)
+                bundle = (
+                    consumer / "config.d/opencode"
+                    if profile == "global"
+                    else consumer / "components/agent-core"
+                )
+                config_path = bundle / "opencode.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["permission"]["bash"].pop("*", None)
+                config["permission"]["bash"].pop(pattern, None)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                agent = bundle / "agents" / f"{role}.md" if profile == "global" else bundle / ".opencode/agents" / f"{role}.md"
+                contents = agent.read_text(encoding="utf-8")
+                contents = contents.replace('    "*": ask\n', "", 1)
+                contents = contents.replace(f'    "{pattern}": {expected_action}\n', "", 1)
+                agent.write_text(contents, encoding="utf-8")
+                lines, counts = audit_profile(profile, consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertTrue(
+                    any(
+                        f"surface={role}" in line
+                        and "actual=unproven" in line
+                        and "reason=implicit_default" in line
+                        for line in lines
+                    ),
+                    lines,
+                )
+
+    def test_leaf_without_approval_signal_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            contents = manifest.read_text(encoding="utf-8").replace(
+                'id = "general"\nboundary = "leaf"\n'
+                'base_source = "opencode.json"\n'
+                'agent_source = "agents/general.md"\n'
+                'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
+                'id = "general"\nboundary = "leaf"\n'
+                'base_source = "opencode.json"\n'
+                'agent_source = "agents/general.md"\n'
+                'signals = ["NEEDS_DECISION"]',
+                1,
+            )
+            manifest.write_text(contents, encoding="utf-8")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(any("surface='general' missing_signal='NEEDS_APPROVAL'" in line for line in lines), lines)
 
     def test_structural_permission_classes_reject_ask_and_allow(self) -> None:
         patterns = {
@@ -582,18 +790,16 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 for action in ("ask", "allow"):
                     with self.subTest(boundary=boundary, class_id=class_id, action=action), tempfile.TemporaryDirectory() as temporary:
                         consumer = self.make_consumer(Path(temporary), "global")
-                        surface = "parent" if boundary == "parent" else "plan"
-                        if boundary == "parent":
-                            config_path = consumer / "config.d/opencode/opencode.json"
-                            config = json.loads(config_path.read_text(encoding="utf-8"))
-                            config["permission"]["bash"][pattern] = action
-                            config_path.write_text(json.dumps(config), encoding="utf-8")
-                        else:
-                            agent = consumer / "config.d/opencode/agents/plan.md"
-                            contents = agent.read_text(encoding="utf-8").replace(
-                                f'    "{pattern}": deny', f'    "{pattern}": {action}', 1
-                            )
-                            agent.write_text(contents, encoding="utf-8")
+                        surface = "build" if boundary == "parent" else "general"
+                        role = "build" if boundary == "parent" else "general"
+                        agent = consumer / f"config.d/opencode/agents/{role}.md"
+                        expected_action = "ask" if boundary == "parent" and pattern == "rm*" else "deny"
+                        contents = agent.read_text(encoding="utf-8").replace(
+                            f'    "{pattern}": {expected_action}',
+                            f'    "{pattern}": {action}',
+                            1,
+                        )
+                        agent.write_text(contents, encoding="utf-8")
                         lines, counts = audit_profile("global", consumer, self.documents)
                         self.assertEqual(1, counts["DIFF"], lines)
                         self.assertTrue(
@@ -609,15 +815,18 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
     def test_late_stronger_deny_overlap_makes_parent_local_delete_fail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             consumer = self.make_consumer(Path(temporary), "global")
-            config_path = consumer / "config.d/opencode/opencode.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["permission"]["bash"]["rm -rf*"] = "deny"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
+            agent = consumer / "config.d/opencode/agents/build.md"
+            contents = agent.read_text(encoding="utf-8").replace(
+                '    "rm*": ask',
+                '    "rm*": ask\n    "rm -rf*": deny',
+                1,
+            )
+            agent.write_text(contents, encoding="utf-8")
             lines, counts = audit_profile("global", consumer, self.documents)
             self.assertEqual(1, counts["DIFF"], lines)
             self.assertTrue(
                 any(
-                    "surface=parent" in line
+                    "surface=build" in line
                     and "classes=local-filesystem-delete" in line
                     and "expected=ask actual=deny" in line
                     for line in lines
@@ -635,6 +844,22 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             lines, counts = audit_profile("global", consumer, self.documents)
             self.assertEqual(0, counts["DIFF"], lines)
             self.assertEqual(0, counts["MISSING"], lines)
+
+    def test_unrelated_concrete_permission_differences_between_consumers_are_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dotnix = self.make_consumer(Path(temporary), "global")
+            templates = self.make_consumer(Path(temporary), "agent-core")
+            global_config_path = dotnix / "config.d/opencode/opencode.json"
+            global_config = json.loads(global_config_path.read_text(encoding="utf-8"))
+            global_config["permission"]["bash"]["echo*"] = "deny"
+            global_config_path.write_text(json.dumps(global_config), encoding="utf-8")
+            agent_config_path = templates / "components/agent-core/opencode.json"
+            agent_config = json.loads(agent_config_path.read_text(encoding="utf-8"))
+            agent_config["permission"]["bash"]["echo*"] = "allow"
+            agent_config_path.write_text(json.dumps(agent_config), encoding="utf-8")
+            _, counts = audit(dotnix, templates, ROOT)
+            self.assertEqual(0, counts["DIFF"])
+            self.assertEqual(0, counts["MISSING"])
 
     def test_conforming_optional_local_workers_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -806,8 +1031,8 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
 
     def test_symlinked_canonical_agent_escape_is_rejected_for_both_profiles(self) -> None:
         for profile, relative in (
-            ("global", "config.d/opencode/agents/plan.md"),
-            ("agent-core", "components/agent-core/.opencode/agents/plan.md"),
+            ("global", "config.d/opencode/agents/general.md"),
+            ("agent-core", "components/agent-core/.opencode/agents/general.md"),
         ):
             with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -818,8 +1043,18 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 agent.unlink()
                 agent.symlink_to(external)
                 lines, counts = audit_profile(profile, consumer, self.documents)
-                self.assertTrue(any("role=plan" in line and "unsafe_path=forbidden" in line for line in lines), lines)
+                self.assertTrue(any("role=general" in line and "unsafe_path=forbidden" in line for line in lines), lines)
                 self.assertEqual(7, counts["DIFF"])
+
+    def test_cyclic_canonical_agent_symlink_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            agent = consumer / "config.d/opencode/agents/general.md"
+            agent.unlink()
+            agent.symlink_to(agent.name)
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertGreater(counts["DIFF"], 0, lines)
+            self.assertEqual(1, result_exit_code(lines, counts, strict=True))
 
     def test_agent_core_has_no_optional_worker_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -902,7 +1137,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
             consumer = self.make_consumer(Path(temporary), "global")
             (consumer / "config.d/opencode/agents/plan.md").unlink()
             _, counts = audit_profile("global", consumer, self.documents)
-            self.assertEqual(7, counts["MISSING"])
+            self.assertEqual(1, counts["MISSING"])
 
     def test_unknown_profile_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
