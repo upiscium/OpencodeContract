@@ -64,7 +64,21 @@ class PolicyContractTests(unittest.TestCase):
             "system-store-destruction",
         ]
         self.assertEqual(expected_classes, contract["operation_classes"])
+        self.assertEqual("bounded-cross-consumer-safety", contract["scope"])
+        self.assertEqual(
+            "consumer-mapped-semantic-class", contract["classification_input"]
+        )
+        self.assertEqual(
+            "consumer-owned-outside-contract",
+            contract["unclassified_consumer_operation"],
+        )
         self.assertTrue(contract["allow_requires_configured_role_permission"])
+        self.assertEqual("deny-over-ask-over-allow", contract["overlap_resolution"])
+        self.assertEqual(
+            "BLOCKED-over-NEEDS_APPROVAL-over-none",
+            contract["overlap_escalation_resolution"],
+        )
+        self.assertEqual(10, len(contract["required_invariant_ids"]))
 
         classes = document["operation_classes"]
         self.assertEqual(6, len(classes))
@@ -88,6 +102,20 @@ class PolicyContractTests(unittest.TestCase):
         }
         self.assertEqual(expected_matrix, actual_matrix)
 
+    def test_permission_policy_has_no_concrete_command_literals(self) -> None:
+        policy_text = (ROOT / "policy/permission-semantics.toml").read_text(
+            encoding="utf-8"
+        )
+        for literal in (
+            "rm -rf",
+            "git reset --hard",
+            "git clean",
+            "sudo",
+            "nix store delete",
+        ):
+            with self.subTest(literal=literal):
+                self.assertNotIn(literal, policy_text)
+
     def test_local_filesystem_delete_requires_parent_approval(self) -> None:
         operation = {
             item["id"]: item for item in self.docs["permission-semantics"]["operation_classes"]
@@ -96,7 +124,73 @@ class PolicyContractTests(unittest.TestCase):
         self.assertEqual("deny", operation["leaf_disposition"])
         self.assertEqual("NEEDS_APPROVAL", operation["leaf_escalation"])
         self.assertEqual("none", operation["parent_escalation"])
-        self.assertTrue(operation["exact_target_required"])
+        self.assertEqual("bounded-destructive", operation["category"])
+
+    def test_permission_invariants_are_anchored_to_the_contract(self) -> None:
+        required = set(
+            self.docs["permission-semantics"]["contract"]["required_invariant_ids"]
+        )
+        entries = {
+            entry["id"]: entry for entry in self.docs["invariants"]["invariants"]
+        }
+        self.assertTrue(required.issubset(entries))
+        self.assertTrue(
+            all(
+                entries[invariant_id]["contract"] == "permission-semantics"
+                for invariant_id in required
+            )
+        )
+
+    def test_permission_invariant_anchor_cannot_drift_to_another_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            invariants_path = root / "policy/invariants.toml"
+            invariants_path.write_text(
+                invariants_path.read_text(encoding="utf-8").replace(
+                    'contract = "permission-semantics"',
+                    'contract = "other-contract"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "must reference permission-semantics",
+                "\n".join(validate_policy(root)),
+            )
+
+    def test_permission_invariant_anchors_are_closed_and_bidirectional(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.copy_policy_fixture(root)
+            invariants_path = root / "policy/invariants.toml"
+            invariants_path.write_text(
+                invariants_path.read_text(encoding="utf-8")
+                + '\n[[invariants]]\nid = "unlisted-anchor"\nscope = "common"\n'
+                + 'contract = "permission-semantics"\nstatement = "extra"\n',
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "unlisted permission-semantics anchors",
+                "\n".join(validate_policy(root)),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.copy_policy_fixture(root)
+            invariants_path = root / "policy/invariants.toml"
+            invariants_path.write_text(
+                invariants_path.read_text(encoding="utf-8").replace(
+                    'contract = "permission-semantics"',
+                    'contract = "permission-semantics"\nextra = true',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "unknown fields ['extra']",
+                "\n".join(validate_policy(root)),
+            )
 
     def test_structural_history_remote_privilege_and_system_operations_are_denied(self) -> None:
         operations = {
@@ -110,7 +204,7 @@ class PolicyContractTests(unittest.TestCase):
         for operation_id in structural:
             with self.subTest(operation=operation_id):
                 operation = operations[operation_id]
-                self.assertTrue(operation["structural"])
+                self.assertEqual("structural-destructive", operation["category"])
                 self.assertEqual("deny", operation["parent_disposition"])
                 self.assertEqual("deny", operation["leaf_disposition"])
                 self.assertEqual("BLOCKED", operation["parent_escalation"])
@@ -121,7 +215,7 @@ class PolicyContractTests(unittest.TestCase):
         self.assertEqual("deny", privilege["leaf_disposition"])
         self.assertEqual("BLOCKED", privilege["parent_escalation"])
         self.assertEqual("BLOCKED", privilege["leaf_escalation"])
-        self.assertTrue(privilege["permission_mutation"])
+        self.assertEqual("authority-change", privilege["category"])
 
     def test_needs_approval_has_minimum_evidence_and_fail_closed_invariants(self) -> None:
         signal = self.docs["permission-semantics"]["signals"]["NEEDS_APPROVAL"]
@@ -203,6 +297,40 @@ class PolicyContractTests(unittest.TestCase):
             path.write_text(contents, encoding="utf-8")
             self.assert_permission_semantics_error(
                 validate_policy(root), "local-filesystem-delete", "disposition"
+            )
+
+    def test_permission_semantics_rejects_non_fail_closed_overlap_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    'overlap_resolution = "deny-over-ask-over-allow"',
+                    'overlap_resolution = "allow-over-deny"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assert_permission_semantics_error(
+                validate_policy(root), "overlap_resolution", "deny-over-ask-over-allow"
+            )
+
+    def test_permission_semantics_rejects_non_fail_closed_overlap_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.copy_policy_fixture(root)
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    'overlap_escalation_resolution = "BLOCKED-over-NEEDS_APPROVAL-over-none"',
+                    'overlap_escalation_resolution = "NEEDS_APPROVAL-over-BLOCKED-over-none"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assert_permission_semantics_error(
+                validate_policy(root),
+                "overlap_escalation_resolution",
+                "BLOCKED-over-NEEDS_APPROVAL-over-none",
             )
 
     def test_permission_semantics_rejects_missing_required_operation_class(self) -> None:

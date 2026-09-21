@@ -3,6 +3,8 @@ schema_version = 1
 [contract]
 id = "permission-semantics"
 closed_world = true
+scope = "bounded-cross-consumer-safety"
+classification_input = "consumer-mapped-semantic-class"
 profiles = ["global", "agent-core"]
 authorities = ["approval-capable-parent", "non-interactive-leaf"]
 operation_classes = [
@@ -16,10 +18,25 @@ operation_classes = [
 dispositions = ["allow", "ask", "deny"]
 escalation_outcomes = ["none", "NEEDS_APPROVAL", "BLOCKED"]
 allow_requires_configured_role_permission = true
+overlap_resolution = "deny-over-ask-over-allow"
+overlap_escalation_resolution = "BLOCKED-over-NEEDS_APPROVAL-over-none"
+unclassified_consumer_operation = "consumer-owned-outside-contract"
 unknown_operation_class = "BLOCKED"
 unknown_profile = "BLOCKED"
 unknown_authority = "BLOCKED"
 out_of_authority = "BLOCKED"
+required_invariant_ids = [
+  "bounded-safety-semantics-canonical",
+  "permission-map-implementation-owned",
+  "leaf-no-direct-ask-execution-permission-mutation",
+  "no-permission-bypass",
+  "parent-independent-reevaluation-no-relay",
+  "out-of-authority-blocked",
+  "user-rejection-exact-operation-final",
+  "needs-approval-minimum",
+  "needs-decision-not-approval",
+  "canonical-policy-no-shell-literals",
+]
 
 [authorities."approval-capable-parent"]
 interactive = true
@@ -62,10 +79,7 @@ parent_disposition = "allow"
 leaf_disposition = "allow"
 parent_escalation = "none"
 leaf_escalation = "none"
-mutation_scope = "read-only"
-bounded = true
-structural = false
-destructive = false
+category = "safe"
 
 [[operation_classes]]
 id = "local-filesystem-delete"
@@ -73,11 +87,7 @@ parent_disposition = "ask"
 leaf_disposition = "deny"
 parent_escalation = "none"
 leaf_escalation = "NEEDS_APPROVAL"
-mutation_scope = "bounded-local"
-bounded = true
-structural = false
-destructive = true
-exact_target_required = true
+category = "bounded-destructive"
 
 [[operation_classes]]
 id = "repository-history-destruction"
@@ -85,12 +95,7 @@ parent_disposition = "deny"
 leaf_disposition = "deny"
 parent_escalation = "BLOCKED"
 leaf_escalation = "BLOCKED"
-mutation_scope = "repository-structural"
-bounded = false
-structural = true
-destructive = true
-irreversible = true
-exact_target_required = true
+category = "structural-destructive"
 
 [[operation_classes]]
 id = "remote-destructive-operation"
@@ -98,12 +103,7 @@ parent_disposition = "deny"
 leaf_disposition = "deny"
 parent_escalation = "BLOCKED"
 leaf_escalation = "BLOCKED"
-mutation_scope = "remote-structural"
-bounded = false
-structural = true
-destructive = true
-irreversible = true
-exact_target_required = true
+category = "structural-destructive"
 
 [[operation_classes]]
 id = "privilege-escalation"
@@ -111,11 +111,7 @@ parent_disposition = "deny"
 leaf_disposition = "deny"
 parent_escalation = "BLOCKED"
 leaf_escalation = "BLOCKED"
-mutation_scope = "authority-change"
-bounded = false
-structural = false
-destructive = false
-permission_mutation = true
+category = "authority-change"
 
 [[operation_classes]]
 id = "system-store-destruction"
@@ -123,12 +119,7 @@ parent_disposition = "deny"
 leaf_disposition = "deny"
 parent_escalation = "BLOCKED"
 leaf_escalation = "BLOCKED"
-mutation_scope = "system-structural"
-bounded = false
-structural = true
-destructive = true
-irreversible = true
-exact_target_required = true
+category = "structural-destructive"
 
 [signals.NEEDS_APPROVAL]
 kind = "permission-escalation"

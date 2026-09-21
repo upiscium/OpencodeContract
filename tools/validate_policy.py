@@ -41,29 +41,65 @@ PERMISSION_OPERATION_CLASSES = (
 )
 PERMISSION_DISPOSITIONS = ("allow", "ask", "deny")
 PERMISSION_ESCALATIONS = ("none", "NEEDS_APPROVAL", "BLOCKED")
+PERMISSION_REQUIRED_INVARIANT_IDS = (
+    "bounded-safety-semantics-canonical",
+    "permission-map-implementation-owned",
+    "leaf-no-direct-ask-execution-permission-mutation",
+    "no-permission-bypass",
+    "parent-independent-reevaluation-no-relay",
+    "out-of-authority-blocked",
+    "user-rejection-exact-operation-final",
+    "needs-approval-minimum",
+    "needs-decision-not-approval",
+    "canonical-policy-no-shell-literals",
+)
+PERMISSION_CATEGORIES = (
+    "safe",
+    "bounded-destructive",
+    "structural-destructive",
+    "authority-change",
+)
+PERMISSION_OPERATION_CATEGORIES = {
+    "safe-read-only": "safe",
+    "local-filesystem-delete": "bounded-destructive",
+    "repository-history-destruction": "structural-destructive",
+    "remote-destructive-operation": "structural-destructive",
+    "privilege-escalation": "authority-change",
+    "system-store-destruction": "structural-destructive",
+}
 
 PERMISSION_CONTRACT_KEYS = {
-    "id", "closed_world", "profiles", "authorities", "operation_classes",
-    "dispositions", "escalation_outcomes", "unknown_operation_class",
-    "allow_requires_configured_role_permission", "unknown_profile",
-    "unknown_authority", "out_of_authority",
+    "id", "closed_world", "scope", "classification_input", "profiles",
+    "authorities", "operation_classes", "dispositions", "escalation_outcomes",
+    "allow_requires_configured_role_permission", "overlap_resolution",
+    "overlap_escalation_resolution", "unclassified_consumer_operation",
+    "unknown_operation_class", "unknown_profile", "unknown_authority",
+    "out_of_authority", "required_invariant_ids",
 }
-PERMISSION_CONTRACT_VALUES = {
+PERMISSION_CONTRACT_FIXED_VALUES = {
     "id": "permission-semantics",
     "closed_world": True,
-    "profiles": list(PERMISSION_PROFILES),
-    "authorities": list(PERMISSION_AUTHORITIES),
-    "operation_classes": list(PERMISSION_OPERATION_CLASSES),
-    "dispositions": list(PERMISSION_DISPOSITIONS),
-    "escalation_outcomes": list(PERMISSION_ESCALATIONS),
+    "scope": "bounded-cross-consumer-safety",
+    "classification_input": "consumer-mapped-semantic-class",
     "allow_requires_configured_role_permission": True,
+    "overlap_resolution": "deny-over-ask-over-allow",
+    "overlap_escalation_resolution": "BLOCKED-over-NEEDS_APPROVAL-over-none",
+    "unclassified_consumer_operation": "consumer-owned-outside-contract",
     "unknown_operation_class": "BLOCKED",
     "unknown_profile": "BLOCKED",
     "unknown_authority": "BLOCKED",
     "out_of_authority": "BLOCKED",
 }
+PERMISSION_CONTRACT_LIST_VALUES = {
+    "profiles": list(PERMISSION_PROFILES),
+    "authorities": list(PERMISSION_AUTHORITIES),
+    "operation_classes": list(PERMISSION_OPERATION_CLASSES),
+    "dispositions": list(PERMISSION_DISPOSITIONS),
+    "escalation_outcomes": list(PERMISSION_ESCALATIONS),
+    "required_invariant_ids": list(PERMISSION_REQUIRED_INVARIANT_IDS),
+}
 
-PERMISSION_AUTHORITY_VALUES = {
+PERMISSION_AUTHORITY_REQUIRED_VALUES = {
     "approval-capable-parent": {
         "interactive": True,
         "can_ask": True,
@@ -92,91 +128,21 @@ PERMISSION_AUTHORITY_VALUES = {
 }
 PERMISSION_AUTHORITY_KEYS = {
     authority: set(values)
-    for authority, values in PERMISSION_AUTHORITY_VALUES.items()
+    for authority, values in PERMISSION_AUTHORITY_REQUIRED_VALUES.items()
 }
 PERMISSION_PROFILE_BINDING_KEYS = {"profile", "parent_authority", "leaf_authority"}
 
-PERMISSION_OPERATION_VALUES = {
-    "safe-read-only": {
-        "id": "safe-read-only",
-        "parent_disposition": "allow",
-        "leaf_disposition": "allow",
-        "parent_escalation": "none",
-        "leaf_escalation": "none",
-        "mutation_scope": "read-only",
-        "bounded": True,
-        "structural": False,
-        "destructive": False,
-    },
-    "local-filesystem-delete": {
-        "id": "local-filesystem-delete",
-        "parent_disposition": "ask",
-        "leaf_disposition": "deny",
-        "parent_escalation": "none",
-        "leaf_escalation": "NEEDS_APPROVAL",
-        "mutation_scope": "bounded-local",
-        "bounded": True,
-        "structural": False,
-        "destructive": True,
-        "exact_target_required": True,
-    },
-    "repository-history-destruction": {
-        "id": "repository-history-destruction",
-        "parent_disposition": "deny",
-        "leaf_disposition": "deny",
-        "parent_escalation": "BLOCKED",
-        "leaf_escalation": "BLOCKED",
-        "mutation_scope": "repository-structural",
-        "bounded": False,
-        "structural": True,
-        "destructive": True,
-        "irreversible": True,
-        "exact_target_required": True,
-    },
-    "remote-destructive-operation": {
-        "id": "remote-destructive-operation",
-        "parent_disposition": "deny",
-        "leaf_disposition": "deny",
-        "parent_escalation": "BLOCKED",
-        "leaf_escalation": "BLOCKED",
-        "mutation_scope": "remote-structural",
-        "bounded": False,
-        "structural": True,
-        "destructive": True,
-        "irreversible": True,
-        "exact_target_required": True,
-    },
-    "privilege-escalation": {
-        "id": "privilege-escalation",
-        "parent_disposition": "deny",
-        "leaf_disposition": "deny",
-        "parent_escalation": "BLOCKED",
-        "leaf_escalation": "BLOCKED",
-        "mutation_scope": "authority-change",
-        "bounded": False,
-        "structural": False,
-        "destructive": False,
-        "permission_mutation": True,
-    },
-    "system-store-destruction": {
-        "id": "system-store-destruction",
-        "parent_disposition": "deny",
-        "leaf_disposition": "deny",
-        "parent_escalation": "BLOCKED",
-        "leaf_escalation": "BLOCKED",
-        "mutation_scope": "system-structural",
-        "bounded": False,
-        "structural": True,
-        "destructive": True,
-        "irreversible": True,
-        "exact_target_required": True,
-    },
-}
 PERMISSION_OPERATION_KEYS = {
-    operation: set(values)
-    for operation, values in PERMISSION_OPERATION_VALUES.items()
+    operation: {
+        "id",
+        "parent_disposition",
+        "leaf_disposition",
+        "parent_escalation",
+        "leaf_escalation",
+        "category",
+    }
+    for operation in PERMISSION_OPERATION_CLASSES
 }
-PERMISSION_OPERATION_ALL_KEYS = set().union(*PERMISSION_OPERATION_KEYS.values())
 
 PERMISSION_SIGNAL_VALUES = {
     "NEEDS_APPROVAL": {
@@ -314,6 +280,17 @@ def _permission_check_operation_semantics(
     location: str,
     errors: list[str],
 ) -> None:
+    operation_id = operation.get("id")
+    category = operation.get("category")
+    if not isinstance(category, str) or category not in PERMISSION_CATEGORIES:
+        errors.append(f"{location}.category: unknown category {category!r}")
+    elif operation_id in PERMISSION_OPERATION_CATEGORIES:
+        expected_category = PERMISSION_OPERATION_CATEGORIES[operation_id]
+        if category != expected_category:
+            errors.append(
+                f"{location}.category: must be {expected_category!r}"
+            )
+
     disposition_fields = ("parent_disposition", "leaf_disposition")
     escalation_fields = ("parent_escalation", "leaf_escalation")
     for field in disposition_fields:
@@ -346,7 +323,7 @@ def _permission_check_operation_semantics(
                         f"{escalation_field} combination"
                     )
 
-    if operation.get("structural") is True:
+    if category == "structural-destructive":
         for field in disposition_fields:
             if operation.get(field) == "allow" or operation.get(field) == "ask":
                 errors.append(f"{location}.{field}: structural operations must deny")
@@ -354,17 +331,44 @@ def _permission_check_operation_semantics(
             if operation.get(field) != "BLOCKED":
                 errors.append(f"{location}.{field}: structural operations must be BLOCKED")
 
-    if operation.get("destructive") is True or operation.get("permission_mutation") is True:
+    if category in {"bounded-destructive", "authority-change"}:
         for field in disposition_fields:
             if operation.get(field) == "allow":
                 errors.append(f"{location}.{field}: destructive or permission-mutating operations cannot allow")
 
-    if operation.get("id") != "safe-read-only":
+    if operation_id != "safe-read-only":
         for disposition_field, escalation_field in zip(disposition_fields, escalation_fields):
             if operation.get(disposition_field) == "allow" and operation.get(escalation_field) == "none":
                 errors.append(
                     f"{location}: silent allow is only valid for safe-read-only"
                 )
+
+    if category == "safe":
+        expected_matrix = {
+            "parent_disposition": "allow",
+            "leaf_disposition": "allow",
+            "parent_escalation": "none",
+            "leaf_escalation": "none",
+        }
+    elif category == "bounded-destructive":
+        expected_matrix = {
+            "parent_disposition": "ask",
+            "leaf_disposition": "deny",
+            "parent_escalation": "none",
+            "leaf_escalation": "NEEDS_APPROVAL",
+        }
+    elif category in {"structural-destructive", "authority-change"}:
+        expected_matrix = {
+            "parent_disposition": "deny",
+            "leaf_disposition": "deny",
+            "parent_escalation": "BLOCKED",
+            "leaf_escalation": "BLOCKED",
+        }
+    else:
+        expected_matrix = {}
+    for field, expected in expected_matrix.items():
+        if field in operation and operation[field] != expected:
+            errors.append(f"{location}.{field}: must be {expected!r}")
 
 
 def _validate_permission_semantics(document: Any, errors: list[str]) -> None:
@@ -375,8 +379,11 @@ def _validate_permission_semantics(document: Any, errors: list[str]) -> None:
     contract_location = f"{PERMISSION_POLICY_LOCATION}.contract"
     if _permission_check_keys(contract, PERMISSION_CONTRACT_KEYS, contract_location, errors):
         _permission_check_values(
-            contract, PERMISSION_CONTRACT_VALUES, contract_location, errors
+            contract, PERMISSION_CONTRACT_FIXED_VALUES, contract_location, errors
         )
+        for field, expected in PERMISSION_CONTRACT_LIST_VALUES.items():
+            if field in contract and contract[field] != expected:
+                errors.append(f"{contract_location}.{field}: must be {expected!r}")
         _permission_check_reference_list(
             contract, "profiles", PERMISSION_PROFILES, "profile", contract_location, errors
         )
@@ -407,21 +414,28 @@ def _validate_permission_semantics(document: Any, errors: list[str]) -> None:
             contract_location,
             errors,
         )
+        invariant_ids = contract.get("required_invariant_ids")
+        if not isinstance(invariant_ids, list) or not all(
+            isinstance(identifier, str) and identifier for identifier in invariant_ids
+        ):
+            errors.append(
+                f"{contract_location}.required_invariant_ids: must be a non-empty string list"
+            )
 
     authorities = document.get("authorities")
     if isinstance(authorities, dict):
         _permission_check_keys(
             authorities,
-            set(PERMISSION_AUTHORITY_VALUES),
+            set(PERMISSION_AUTHORITY_REQUIRED_VALUES),
             f"{PERMISSION_POLICY_LOCATION}.authorities",
             errors,
         )
         for authority in authorities:
-            if authority not in PERMISSION_AUTHORITY_VALUES:
+            if authority not in PERMISSION_AUTHORITY_REQUIRED_VALUES:
                 errors.append(
                     f"{PERMISSION_POLICY_LOCATION}.authorities: unknown authority {authority!r}"
                 )
-        for authority, expected in PERMISSION_AUTHORITY_VALUES.items():
+        for authority, expected in PERMISSION_AUTHORITY_REQUIRED_VALUES.items():
             definition = authorities.get(authority)
             location = f"{PERMISSION_POLICY_LOCATION}.authorities.{authority}"
             if _permission_check_keys(definition, PERMISSION_AUTHORITY_KEYS[authority], location, errors):
@@ -429,7 +443,7 @@ def _validate_permission_semantics(document: Any, errors: list[str]) -> None:
     else:
         _permission_check_keys(
             authorities,
-            set(PERMISSION_AUTHORITY_VALUES),
+            set(PERMISSION_AUTHORITY_REQUIRED_VALUES),
             f"{PERMISSION_POLICY_LOCATION}.authorities",
             errors,
         )
@@ -494,21 +508,21 @@ def _validate_permission_semantics(document: Any, errors: list[str]) -> None:
             operation_id = operation.get("id")
             if not isinstance(operation_id, str):
                 errors.append(f"{location}.id: unknown operation class {operation_id!r}")
-                _permission_check_keys(operation, PERMISSION_OPERATION_ALL_KEYS, location, errors)
+                _permission_check_keys(operation, set(), location, errors)
                 continue
-            if operation_id not in PERMISSION_OPERATION_VALUES:
+            if operation_id not in PERMISSION_OPERATION_CLASSES:
                 errors.append(f"{location}.id: unknown operation class {operation_id!r}")
-                _permission_check_keys(operation, PERMISSION_OPERATION_ALL_KEYS, location, errors)
+                _permission_check_keys(operation, set(), location, errors)
                 continue
             if operation_id in seen_operations:
                 errors.append(f"{location}.id: duplicate operation class {operation_id!r}")
             seen_operations.add(operation_id)
-            expected = PERMISSION_OPERATION_VALUES[operation_id]
             operation_location = f"{location}.{operation_id}"
             if _permission_check_keys(
                 operation, PERMISSION_OPERATION_KEYS[operation_id], operation_location, errors
             ):
-                _permission_check_values(operation, expected, operation_location, errors)
+                if operation.get("id") != operation_id:
+                    errors.append(f"{operation_location}.id: must be {operation_id!r}")
             _permission_check_operation_semantics(operation, operation_location, errors)
         missing_operations = set(PERMISSION_OPERATION_CLASSES) - seen_operations
         if missing_operations:
@@ -770,6 +784,7 @@ def validate_policy(root: Path = ROOT) -> list[str]:
             )
 
     semantic_ids: dict[str, str] = {}
+    invariant_entries: dict[str, dict[str, Any]] = {}
     difference_targets: set[tuple[str, str]] = set()
     for section in ("invariants", "intentional_differences"):
         entries = docs["invariants"].get(section, [])
@@ -780,6 +795,26 @@ def validate_policy(root: Path = ROOT) -> list[str]:
             if not isinstance(entry, dict):
                 errors.append(f"policy/invariants.toml: {section} entries must be tables")
                 continue
+            if section == "invariants":
+                permission_anchor = entry.get("contract") == "permission-semantics"
+                expected_keys = (
+                    {"id", "scope", "contract", "statement"}
+                    if permission_anchor
+                    else {"id", "scope", "statement"}
+                )
+                _permission_check_keys(
+                    entry,
+                    expected_keys,
+                    "policy/invariants.toml: invariants entry",
+                    errors,
+                )
+            else:
+                _permission_check_keys(
+                    entry,
+                    {"id", "role", "field"},
+                    "policy/invariants.toml: intentional_differences entry",
+                    errors,
+                )
             semantic_id = entry.get("id")
             if not isinstance(semantic_id, str) or not semantic_id:
                 errors.append(f"policy/invariants.toml: {section} entry requires id")
@@ -787,6 +822,8 @@ def validate_policy(root: Path = ROOT) -> list[str]:
                 errors.append(f"policy/invariants.toml: duplicate semantic id {semantic_id!r}")
             else:
                 semantic_ids[semantic_id] = section
+                if section == "invariants":
+                    invariant_entries[semantic_id] = entry
             if section == "invariants" and (entry.get("scope") not in {"common", *profiles} or not entry.get("statement")):
                 errors.append(f"invariants.{semantic_id}: scope and statement are required")
             if section == "intentional_differences":
@@ -821,6 +858,33 @@ def validate_policy(root: Path = ROOT) -> list[str]:
                         f"intentional_differences.{semantic_id}: canonical values must not be duplicated "
                         f"({sorted(forbidden_value_keys)})"
                     )
+
+    permission_contract = docs["permission-semantics"].get("contract", {})
+    required_permission_invariants = permission_contract.get("required_invariant_ids", [])
+    if isinstance(required_permission_invariants, list):
+        anchored_ids = {
+            invariant_id
+            for invariant_id, entry in invariant_entries.items()
+            if entry.get("contract") == "permission-semantics"
+        }
+        extra_anchors = anchored_ids - set(required_permission_invariants)
+        if extra_anchors:
+            errors.append(
+                "policy/invariants.toml: unlisted permission-semantics anchors "
+                f"{sorted(extra_anchors)}"
+            )
+        for invariant_id in required_permission_invariants:
+            entry = invariant_entries.get(invariant_id)
+            if entry is None:
+                errors.append(
+                    "policy/permission-semantics.contract.required_invariant_ids: "
+                    f"missing invariant {invariant_id!r}"
+                )
+            elif entry.get("contract") != "permission-semantics":
+                errors.append(
+                    f"policy/invariants.toml: invariant {invariant_id!r} must reference "
+                    "permission-semantics"
+                )
 
     for name, doc in docs.items():
         if name == "models":

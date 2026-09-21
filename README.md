@@ -125,6 +125,19 @@ The `allow` disposition is conditional: a consumer may allow a safe/read-only
 operation only where its configured role permission permits it. The contract
 does not define that role permission map.
 
+This is a bounded classification contract, not an exhaustive taxonomy of every
+operation a consumer may implement. The closed world is closed over the six
+semantic class identifiers after a consumer supplies a semantic classification.
+Consumer operations outside this bounded safety boundary remain consumer-owned
+and are not silently assigned a canonical disposition. An unknown or malformed
+class identifier presented to this contract is fail-closed as `BLOCKED`.
+When a consumer's classification overlaps more than one canonical class, the
+most restrictive result wins: `deny` takes precedence over `ask`, which takes
+precedence over `allow`; for escalation outcomes, `BLOCKED` takes precedence
+over `NEEDS_APPROVAL`, which takes precedence over `none`. A structural or
+privileged classification therefore cannot be downgraded to the local-delete
+approval path.
+
 Local filesystem deletion is the bounded approval path: the parent asks the
 user, while the leaf denies direct execution and returns `NEEDS_APPROVAL`.
 `NEEDS_APPROVAL` is the minimum non-terminal escalation outcome; it grants no
@@ -153,7 +166,7 @@ permissions, or bypasses a required decision. The parent independently
 reevaluates a leaf escalation request, does not relay or auto-approve it, and
 must not retry, rephrase, redelegate, or replace an exact operation rejected by
 the user during the same task.
-Unknown or out-of-authority classes, profiles, and authorities return
+Unknown class identifiers and out-of-authority profiles or authorities return
 `BLOCKED`. A user's rejection is final for the exact operation within the
 current task. `NEEDS_DECISION` is different from permission escalation: it is
 reserved for unresolved requirements, product, or architecture ambiguity that
@@ -163,6 +176,11 @@ resolve it from the contract or available evidence.
 Canonical policy uses semantic class identifiers and outcomes, not shell
 command literals. This keeps bounded cross-consumer safety semantics canonical
 without making a consumer's complete permission map canonical.
+
+`policy/permission-semantics.toml` is the normative machine-readable source.
+The permission-related entries in `policy/invariants.toml` are cross-consumer
+invariant anchors linked to that source; the validator rejects missing or
+mislinked anchors.
 
 ## Intentionally not canonical
 
@@ -192,7 +210,8 @@ opencode-contract validate
 The validator parses all TOML documents and checks semantic ID uniqueness,
 model/role/profile references, required fields, model ID syntax, applicability
 consistency, complete single-model assignments, intentional differences, the
-fixed model-availability contract, and the closed permission-semantics schema.
+fixed model-availability contract, the closed permission-semantics schema, and
+the permission invariant anchors.
 
 ## Audit consumers
 
