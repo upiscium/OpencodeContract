@@ -226,6 +226,17 @@ later concrete rules override earlier wildcards. If no explicit rule matches a
 probe, the result is `unproven` and strict conformance fails; the audit never
 guesses a mutable OpenCode default such as `ask`.
 
+Coverage requirements are derived from the canonical policy. When
+`allow_requires_configured_role_permission` is true, a class whose required
+disposition is `allow` at both boundaries is conditional role permission: a
+surface may omit that class and intentionally deny the corresponding concrete
+operation. `safe-read-only` therefore does not require every consumer role to
+permit `bash` or another safe operation. If a surface declares a safe-read-only
+probe, it has declared that consumer-owned operation as permitted and the
+effective stack must explicitly resolve it to `allow`; `ask`, `deny`, and
+`unproven` are drift. Classes with any non-`allow` safety disposition remain
+mandatory coverage and cannot be omitted to bypass the audit.
+
 The canonical profile policy binds the required executable authority surfaces:
 Global `build` is the approval-capable `parent`; Global subagents are `leaf`
 surfaces. Agent-Core `task-orchestrator` is the approval-capable `parent`; its

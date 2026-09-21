@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import shutil
 import sys
 import tempfile
@@ -11,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from audit_consumers import audit  # noqa: E402
-from policy_audit import audit_profile, result_exit_code  # noqa: E402
+from policy_audit import (  # noqa: E402
+    _permission_contract_context,
+    audit_profile,
+    result_exit_code,
+)
 from validate_policy import load_policy, validate_policy  # noqa: E402
 
 
@@ -43,8 +48,7 @@ PARENT_BASH_PERMISSIONS = {
     "nix store delete*": "deny",
 }
 LEAF_BASH_PERMISSIONS = {
-    "*": "ask",
-    "git status*": "allow",
+    "*": "deny",
     "rm*": "deny",
     "git reset --hard*": "deny",
     "git clean*": "deny",
@@ -78,6 +82,11 @@ class PolicyContractTests(unittest.TestCase):
         ):
             assignments = self.docs[profile]["assignments"]
             surface_policy = self.docs[profile]["permission_surfaces"]
+            permission_context, context_errors = _permission_contract_context(
+                profile, self.docs
+            )
+            if context_errors or permission_context is None:
+                raise AssertionError(context_errors)
             parent_roles = set(surface_policy["parent_roles"])
             for role, assignment in assignments.items():
                 mode = roles[role]["kind"]
@@ -124,8 +133,14 @@ class PolicyContractTests(unittest.TestCase):
                         'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
                     ]
                 )
-            for surface_id, _ in surface_roles:
-                for input_value, class_id in PERMISSION_PROBES:
+            for surface_id, boundary in surface_roles:
+                probes = tuple(
+                    (input_value, class_id)
+                    for input_value, class_id in PERMISSION_PROBES
+                    if boundary == "parent"
+                    or class_id in permission_context["mandatory_classes"]
+                )
+                for input_value, class_id in probes:
                     manifest_lines.extend(
                         [
                             "",
@@ -178,6 +193,7 @@ class PolicyContractTests(unittest.TestCase):
             contract["unclassified_consumer_operation"],
         )
         self.assertTrue(contract["allow_requires_configured_role_permission"])
+
         self.assertEqual("deny-over-ask-over-allow", contract["overlap_resolution"])
         self.assertEqual(
             "BLOCKED-over-NEEDS_APPROVAL-over-none",
@@ -206,6 +222,36 @@ class PolicyContractTests(unittest.TestCase):
             for operation in classes
         }
         self.assertEqual(expected_matrix, actual_matrix)
+
+    def test_permission_coverage_condition_is_derived_from_canonical_policy(self) -> None:
+        context, errors = _permission_contract_context("global", self.docs)
+        self.assertEqual([], errors)
+        assert context is not None
+        self.assertEqual(["safe-read-only"], context["conditional_classes"])
+        self.assertNotIn("safe-read-only", context["mandatory_classes"])
+
+        flag_disabled = copy.deepcopy(self.docs)
+        flag_disabled["permission-semantics"]["contract"][
+            "allow_requires_configured_role_permission"
+        ] = False
+        context, errors = _permission_contract_context("global", flag_disabled)
+        self.assertEqual([], errors)
+        assert context is not None
+        self.assertEqual([], context["conditional_classes"])
+        self.assertIn("safe-read-only", context["mandatory_classes"])
+
+        one_boundary_not_allow = copy.deepcopy(self.docs)
+        for operation in one_boundary_not_allow["permission-semantics"][
+            "operation_classes"
+        ]:
+            if operation["id"] == "safe-read-only":
+                operation["leaf_disposition"] = "deny"
+                break
+        context, errors = _permission_contract_context("global", one_boundary_not_allow)
+        self.assertEqual([], errors)
+        assert context is not None
+        self.assertNotIn("safe-read-only", context["conditional_classes"])
+        self.assertIn("safe-read-only", context["mandatory_classes"])
 
     def test_permission_policy_has_no_concrete_command_literals(self) -> None:
         policy_text = (ROOT / "policy/permission-semantics.toml").read_text(
@@ -784,11 +830,17 @@ class PolicyContractTests(unittest.TestCase):
                     lines, counts = audit_profile(profile, consumer, self.docs)
                     self.assertEqual(0, counts["DIFF"], lines)
                     self.assertEqual(0, counts["MISSING"], lines)
-                    surfaces = [
+                    surface_roles = [
                         *self.docs[profile]["permission_surfaces"]["parent_roles"],
                         *self.docs[profile]["permission_surfaces"]["leaf_roles"],
                     ]
-                    for surface in surfaces:
+                    permission_context, context_errors = _permission_contract_context(
+                        profile, self.docs
+                    )
+                    self.assertEqual([], context_errors)
+                    assert permission_context is not None
+                    mandatory_classes = set(permission_context["mandatory_classes"])
+                    for surface in surface_roles:
                         observed = {
                             class_id
                             for _, class_id in PERMISSION_PROBES
@@ -798,7 +850,25 @@ class PolicyContractTests(unittest.TestCase):
                                 for line in lines
                             )
                         }
-                        self.assertEqual(set(PERMISSION_CLASSES), observed, surface)
+                        self.assertTrue(mandatory_classes <= observed, surface)
+                    self.assertTrue(
+                        any(
+                            line.startswith(f"PASS profile={profile} surface={surface} ")
+                            and "classes=safe-read-only" in line
+                            for surface in self.docs[profile]["permission_surfaces"]["parent_roles"]
+                            for line in lines
+                        ),
+                        lines,
+                    )
+                    self.assertFalse(
+                        any(
+                            line.startswith(f"PASS profile={profile} surface={surface} ")
+                            and "classes=safe-read-only" in line
+                            for surface in self.docs[profile]["permission_surfaces"]["leaf_roles"]
+                            for line in lines
+                        ),
+                        lines,
+                    )
                     bundle = (
                         consumer / "config.d/opencode"
                         if profile == "global"

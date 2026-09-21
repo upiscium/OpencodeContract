@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from policy_audit import audit_profile  # noqa: E402
+from policy_audit import _permission_contract_context, audit_profile  # noqa: E402
 from validate_policy import load_policy  # noqa: E402
 
 
@@ -33,8 +33,7 @@ PARENT_BASH_PERMISSIONS = {
     "nix store delete*": "deny",
 }
 LEAF_BASH_PERMISSIONS = {
-    "*": "ask",
-    "git status*": "allow",
+    "*": "deny",
     "rm*": "deny",
     "git reset --hard*": "deny",
     "git clean*": "deny",
@@ -60,6 +59,11 @@ class PackagedGlobalPathTests(unittest.TestCase):
 
         models = self.documents["models"]["models"]
         roles = self.documents["roles"]["roles"]
+        permission_context, context_errors = _permission_contract_context(
+            "global", self.documents
+        )
+        if context_errors or permission_context is None:
+            raise AssertionError(context_errors)
         surface_policy = self.documents["global"]["permission_surfaces"]
         parent_roles = set(surface_policy["parent_roles"])
         for role, assignment in self.documents["global"]["assignments"].items():
@@ -106,7 +110,13 @@ class PackagedGlobalPathTests(unittest.TestCase):
                     'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
                 ]
             )
-            for input_value, class_id in PERMISSION_PROBES:
+            probes = tuple(
+                (input_value, class_id)
+                for input_value, class_id in PERMISSION_PROBES
+                if boundary == "parent"
+                or class_id in permission_context["mandatory_classes"]
+            )
+            for input_value, class_id in probes:
                 manifest_lines.extend(
                     [
                         "",

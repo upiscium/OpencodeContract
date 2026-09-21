@@ -15,6 +15,7 @@ sys.path.insert(0, str(TOOLS))
 
 from audit_consumers import audit  # noqa: E402
 from policy_audit import (  # noqa: E402
+    _permission_contract_context,
     _permission_wildcard_match,
     audit_profile,
     result_exit_code,
@@ -50,8 +51,7 @@ PARENT_BASH_PERMISSIONS = {
     "nix store delete*": "deny",
 }
 LEAF_BASH_PERMISSIONS = {
-    "*": "ask",
-    "git status*": "allow",
+    "*": "deny",
     "rm*": "deny",
     "git reset --hard*": "deny",
     "git clean*": "deny",
@@ -84,6 +84,11 @@ class ConsumerAuditCliTest(unittest.TestCase):
         roles = self.documents["roles"]["roles"]
         assignments = self.documents[profile]["assignments"]
         surface_policy = self.documents[profile]["permission_surfaces"]
+        permission_context, context_errors = _permission_contract_context(
+            profile, self.documents
+        )
+        if context_errors or permission_context is None:
+            raise AssertionError(context_errors)
         parent_roles = set(surface_policy["parent_roles"])
         for role, assignment in assignments.items():
             mode = roles[role]["kind"]
@@ -130,8 +135,14 @@ class ConsumerAuditCliTest(unittest.TestCase):
                     'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
                 ]
             )
-        for surface_id, _ in surface_roles:
-            for input_value, class_id in PERMISSION_PROBES:
+        for surface_id, boundary in surface_roles:
+            probes = tuple(
+                (input_value, class_id)
+                for input_value, class_id in PERMISSION_PROBES
+                if boundary == "parent"
+                or class_id in permission_context["mandatory_classes"]
+            )
+            for input_value, class_id in probes:
                 manifest_lines.extend(
                     [
                         "",
@@ -285,11 +296,17 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 lines, counts = audit_profile(profile, consumer, self.documents)
                 self.assertEqual(0, counts["DIFF"], lines)
                 self.assertEqual(0, counts["MISSING"], lines)
-                surfaces = [
+                surface_roles = [
                     *self.documents[profile]["permission_surfaces"]["parent_roles"],
                     *self.documents[profile]["permission_surfaces"]["leaf_roles"],
                 ]
-                for surface in surfaces:
+                permission_context, context_errors = _permission_contract_context(
+                    profile, self.documents
+                )
+                self.assertEqual([], context_errors)
+                assert permission_context is not None
+                mandatory_classes = set(permission_context["mandatory_classes"])
+                for surface in surface_roles:
                     observed = {
                         class_id
                         for _, class_id in PERMISSION_PROBES
@@ -299,7 +316,25 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                             for line in lines
                         )
                     }
-                    self.assertEqual(set(PERMISSION_CLASSES), observed, surface)
+                    self.assertTrue(mandatory_classes <= observed, surface)
+                self.assertTrue(
+                    any(
+                        line.startswith(f"PASS profile={profile} surface={surface} ")
+                        and "classes=safe-read-only" in line
+                        for surface in self.documents[profile]["permission_surfaces"]["parent_roles"]
+                        for line in lines
+                    ),
+                    lines,
+                )
+                self.assertFalse(
+                    any(
+                        line.startswith(f"PASS profile={profile} surface={surface} ")
+                        and "classes=safe-read-only" in line
+                        for surface in self.documents[profile]["permission_surfaces"]["leaf_roles"]
+                        for line in lines
+                    ),
+                    lines,
+                )
                 source = (
                     "agents/general.md"
                     if profile == "global"
@@ -404,11 +439,11 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 "missing class coverage",
                 lambda contents: contents.replace(
                     '[[probes]]\nsurface = "build"\ntool = "bash"\n'
-                    'input = "git status"\nclasses = ["safe-read-only"]\n\n',
+                    'input = "rm -rf cache"\nclasses = ["local-filesystem-delete"]\n\n',
                     "",
                     1,
                 ),
-                "surface='build' missing_coverage",
+                "missing_coverage=['local-filesystem-delete']",
             ),
         )
         for label, mutate, reason in variants:
@@ -525,7 +560,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 manifest.write_text(contents, encoding="utf-8")
                 lines, counts = audit_profile("global", consumer, self.documents)
                 if label == "missing":
-                    self.assertGreaterEqual(counts["MISSING"], 6, lines)
+                    self.assertGreaterEqual(counts["MISSING"], 5, lines)
                 else:
                     self.assertGreater(counts["DIFF"], 0, lines)
                 self.assertEqual(1, result_exit_code(lines, counts, strict=True))
@@ -563,6 +598,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                     and "boundary=parent" in line
                     and "classes=local-filesystem-delete" in line
                     and "expected=ask actual=ask" in line
+                    and "expected_escalation=none" in line
                     for line in lines
                 ),
                 lines,
@@ -684,6 +720,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                     and "boundary=parent" in line
                     and "classes=local-filesystem-delete" in line
                     and "expected=ask actual=ask" in line
+                    and "expected_escalation=none" in line
                     for line in lines
                 ),
                 lines,
@@ -718,10 +755,180 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                     and "boundary=leaf" in line
                     and "classes=local-filesystem-delete" in line
                     and "expected=deny actual=deny" in line
+                    and "expected_escalation=NEEDS_APPROVAL" in line
                     for line in lines
                 ),
                 lines,
             )
+
+    def test_leaf_may_deny_safe_read_without_permission_broadening(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(0, counts["DIFF"], lines)
+            self.assertFalse(
+                any(
+                    "surface=general" in line and "classes=safe-read-only" in line
+                    for line in lines
+                ),
+                lines,
+            )
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8")
+                + (
+                    '\n[[probes]]\nsurface = "general"\ntool = "bash"\n'
+                    'input = "git status"\nclasses = ["safe-read-only"]\n'
+                ),
+                encoding="utf-8",
+            )
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=general" in line
+                    and "classes=safe-read-only" in line
+                    and "expected=allow actual=deny" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+    def test_safe_read_probe_is_optional_per_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            safe_probe = (
+                '[[probes]]\nsurface = "build"\ntool = "bash"\n'
+                'input = "git status"\nclasses = ["safe-read-only"]\n\n'
+            )
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(safe_probe, "", 1),
+                encoding="utf-8",
+            )
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(0, counts["DIFF"], lines)
+            self.assertEqual(0, counts["MISSING"], lines)
+
+    def test_declared_safe_read_probe_requires_explicit_allow(self) -> None:
+        actions = ("allow", "deny", "ask")
+        for action in actions:
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+                manifest.write_text(
+                    manifest.read_text(encoding="utf-8")
+                    + (
+                        '\n[[probes]]\nsurface = "general"\ntool = "bash"\n'
+                        'input = "git status"\nclasses = ["safe-read-only"]\n'
+                    ),
+                    encoding="utf-8",
+                )
+                agent = consumer / "config.d/opencode/agents/general.md"
+                contents = agent.read_text(encoding="utf-8")
+                if action == "allow":
+                    contents = contents.replace(
+                        '    "*": deny',
+                        '    "*": deny\n    "git status*": allow',
+                        1,
+                    )
+                else:
+                    contents = contents.replace(
+                        '    "*": deny', f'    "*": {action}', 1
+                    )
+                agent.write_text(contents, encoding="utf-8")
+                lines, counts = audit_profile("global", consumer, self.documents)
+                if action == "allow":
+                    self.assertEqual(0, counts["DIFF"], lines)
+                    self.assertTrue(
+                        any(
+                            "surface=general" in line
+                            and "classes=safe-read-only" in line
+                            and "expected=allow actual=allow" in line
+                            for line in lines
+                        ),
+                        lines,
+                    )
+                else:
+                    self.assertEqual(1, counts["DIFF"], lines)
+                    self.assertTrue(
+                        any(
+                            "surface=general" in line
+                            and "classes=safe-read-only" in line
+                            and f"expected=allow actual={action}" in line
+                            for line in lines
+                        ),
+                        lines,
+                    )
+
+    def test_declared_safe_read_probe_without_explicit_match_is_unproven(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = self.make_consumer(Path(temporary), "global")
+            manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+            contents = manifest.read_text(encoding="utf-8").replace(
+                '[[probes]]\nsurface = "build"\ntool = "bash"\n'
+                'input = "git status"\nclasses = ["safe-read-only"]\n\n',
+                "",
+                1,
+            )
+            contents += (
+                '\n[[probes]]\nsurface = "general"\ntool = "bash"\n'
+                'input = "git status"\nclasses = ["safe-read-only"]\n'
+            )
+            manifest.write_text(contents, encoding="utf-8")
+            config_path = consumer / "config.d/opencode/opencode.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["permission"]["bash"].pop("*", None)
+            config["permission"]["bash"].pop("git status*", None)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            agent = consumer / "config.d/opencode/agents/general.md"
+            agent.write_text(
+                agent.read_text(encoding="utf-8").replace('    "*": deny\n', "", 1),
+                encoding="utf-8",
+            )
+            lines, counts = audit_profile("global", consumer, self.documents)
+            self.assertEqual(1, counts["DIFF"], lines)
+            self.assertTrue(
+                any(
+                    "surface=general" in line
+                    and "classes=safe-read-only" in line
+                    and "actual=unproven" in line
+                    and "reason=implicit_default" in line
+                    for line in lines
+                ),
+                lines,
+            )
+
+    def test_destructive_permission_coverage_remains_mandatory(self) -> None:
+        permission_context, context_errors = _permission_contract_context(
+            "global", self.documents
+        )
+        self.assertEqual([], context_errors)
+        assert permission_context is not None
+        for input_value, class_id in PERMISSION_PROBES:
+            if class_id not in permission_context["mandatory_classes"]:
+                continue
+            with self.subTest(class_id=class_id), tempfile.TemporaryDirectory() as temporary:
+                consumer = self.make_consumer(Path(temporary), "global")
+                manifest = consumer / "config.d/opencode/opencode-contract-permissions.toml"
+                probe = (
+                    '[[probes]]\nsurface = "build"\ntool = "bash"\n'
+                    f"input = {json.dumps(input_value)}\n"
+                    f'classes = ["{class_id}"]\n\n'
+                )
+                manifest.write_text(
+                    manifest.read_text(encoding="utf-8").replace(probe, "", 1),
+                    encoding="utf-8",
+                )
+                lines, counts = audit_profile("global", consumer, self.documents)
+                self.assertEqual(1, counts["DIFF"], lines)
+                self.assertTrue(
+                    any(
+                        f"missing_coverage=['{class_id}']" in line
+                        for line in lines
+                    ),
+                    lines,
+                )
 
     def test_unmatched_effective_permission_fails_closed(self) -> None:
         cases = (
@@ -743,7 +950,8 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 config_path.write_text(json.dumps(config), encoding="utf-8")
                 agent = bundle / "agents" / f"{role}.md" if profile == "global" else bundle / ".opencode/agents" / f"{role}.md"
                 contents = agent.read_text(encoding="utf-8")
-                contents = contents.replace('    "*": ask\n', "", 1)
+                default_action = "ask" if role == "build" else "deny"
+                contents = contents.replace(f'    "*": {default_action}\n', "", 1)
                 contents = contents.replace(f'    "{pattern}": {expected_action}\n', "", 1)
                 agent.write_text(contents, encoding="utf-8")
                 lines, counts = audit_profile(profile, consumer, self.documents)
@@ -807,6 +1015,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                                 f"surface={surface}" in line
                                 and f"classes={class_id}" in line
                                 and f"actual={action}" in line
+                                and "expected_escalation=BLOCKED" in line
                                 for line in lines
                             ),
                             lines,
@@ -1044,7 +1253,7 @@ metadata = ["attempts", "retry_reason", "worker", "configured_model", "required_
                 agent.symlink_to(external)
                 lines, counts = audit_profile(profile, consumer, self.documents)
                 self.assertTrue(any("role=general" in line and "unsafe_path=forbidden" in line for line in lines), lines)
-                self.assertEqual(7, counts["DIFF"])
+                self.assertEqual(6, counts["DIFF"])
 
     def test_cyclic_canonical_agent_symlink_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

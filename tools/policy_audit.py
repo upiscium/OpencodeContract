@@ -453,6 +453,14 @@ def _permission_contract_context(
     else:
         escalation_values = list(escalations)
 
+    allow_requires_role_permission = contract.get(
+        "allow_requires_configured_role_permission"
+    )
+    if type(allow_requires_role_permission) is not bool:
+        errors.append(
+            "canonical allow_requires_configured_role_permission is invalid"
+        )
+
     signals_value = document.get("signals")
     signal_ids: list[str] = []
     if not isinstance(signals_value, Mapping):
@@ -501,6 +509,16 @@ def _permission_contract_context(
                     f"canonical {class_id}.{boundary}_escalation is invalid"
                 )
 
+    conditional_classes: list[str] = []
+    if allow_requires_role_permission is True:
+        for class_id in class_ids:
+            operation = operations.get(class_id)
+            if operation is not None and all(
+                operation.get(f"{boundary}_disposition") == "allow"
+                for boundary in PERMISSION_BOUNDARIES
+            ):
+                conditional_classes.append(class_id)
+
     bindings = document.get("profile_bindings")
     binding: Mapping[str, Any] | None = None
     if isinstance(bindings, list):
@@ -541,6 +559,10 @@ def _permission_contract_context(
         return None, errors
     return {
         "classes": class_ids,
+        "mandatory_classes": [
+            class_id for class_id in class_ids if class_id not in conditional_classes
+        ],
+        "conditional_classes": conditional_classes,
         "operations": operations,
         "authorities": boundary_authorities,
         "signals": signal_ids,
@@ -574,6 +596,7 @@ def _permission_manifest_schema(
     document: Any,
     profile: str,
     class_ids: list[str],
+    mandatory_class_ids: list[str],
     expected_surfaces: Mapping[str, tuple[str, str]],
     signal_ids: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
@@ -692,6 +715,7 @@ def _permission_manifest_schema(
     seen_probe_keys: set[tuple[str, str, str]] = set()
     covered: dict[str, set[str]] = {surface_id: set() for surface_id in surface_order}
     class_set = set(class_ids)
+    mandatory_class_set = set(mandatory_class_ids)
     if not isinstance(probes_value, list):
         errors.append("manifest probes must be a list")
     elif not probes_value:
@@ -768,12 +792,16 @@ def _permission_manifest_schema(
                 if surface_id in surfaces:
                     surfaces[surface_id]["probes"].append(probe)
                     covered[surface_id].update(
-                        class_id for class_id in normalized_classes if class_id in class_set
+                        class_id
+                        for class_id in normalized_classes
+                        if class_id in mandatory_class_set
                     )
 
     for surface_id in surface_order:
         missing_classes = [
-            class_id for class_id in class_ids if class_id not in covered[surface_id]
+            class_id
+            for class_id in mandatory_class_ids
+            if class_id not in covered[surface_id]
         ]
         if missing_classes:
             errors.append(
@@ -1047,6 +1075,7 @@ def _audit_permission_contract(
         manifest_document,
         profile,
         context["classes"],
+        context["mandatory_classes"],
         expected_surfaces,
         context["signals"],
     )
