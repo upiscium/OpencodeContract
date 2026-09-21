@@ -14,6 +14,19 @@ invariants = [
   "Repository-local configuration may impose stronger authoritative boundaries.",
 ]
 
+[permission_surfaces]
+parent_roles = ["build"]
+leaf_roles = [
+  "architect",
+  "general",
+  "explore",
+  "verifier",
+  "reviewer",
+  "investigator",
+  "security-reviewer",
+  "scout",
+]
+
 [assignments.build]
 primary_model = "sol"
 authority = "implementation-orchestrator"

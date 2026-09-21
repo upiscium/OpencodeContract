@@ -182,6 +182,92 @@ The permission-related entries in `policy/invariants.toml` are cross-consumer
 invariant anchors linked to that source; the validator rejects missing or
 mislinked anchors.
 
+### Permission-conformance manifest
+
+Each consumer supplies the consumer-owned permission-conformance manifest
+`opencode-contract-permissions.toml` beside the profile-owned `opencode.json`.
+For Global, the manifest is in the package bundle at
+`packages/opencode/config` or the legacy bundle at `config.d/opencode`. For
+Agent-Core, it is in the `components/agent-core` bundle. The manifest is
+declarative: it identifies the consumer's permission surfaces and static
+probes without moving the consumer's complete permission map into this
+contract.
+
+The manifest has a closed schema. Its only top-level keys are
+`schema_version`, `contract`, `profile`, `surfaces`, and `probes`. Each surface
+has exactly `id`, `boundary`, `base_source`, `agent_source`, and `signals`; each
+probe has exactly `surface`, `tool`, `input`, and `classes`.
+
+```toml
+schema_version = 1
+contract = "permission-semantics"
+profile = "<global-or-agent-core>"
+
+[[surfaces]]
+id = "<canonical-role-id>"
+boundary = "<parent-or-leaf>"
+base_source = "opencode.json"
+agent_source = "<relative-agent-source>"
+signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]
+
+[[probes]]
+surface = "<surface-id>"
+tool = "<consumer-tool>"
+input = "<consumer-owned-input>"
+classes = ["<canonical-class-id>"]
+```
+
+The manifest declares executable agent surfaces and semantic class coverage,
+not expected results. A surface is the effective stack of its `base_source`
+and `agent_source`; the base JSON is never an independently executable parent
+surface. OpenCode's ordered last-match behavior is evaluated through the base
+layer first and the agent layer second, so an agent override is effective and
+later concrete rules override earlier wildcards. If no explicit rule matches a
+probe, the result is `unproven` and strict conformance fails; the audit never
+guesses a mutable OpenCode default such as `ask`.
+
+Coverage requirements are derived from the canonical policy. When
+`allow_requires_configured_role_permission` is true, a class whose required
+disposition is `allow` at both boundaries is conditional role permission: a
+surface may omit that class and intentionally deny the corresponding concrete
+operation. `safe-read-only` therefore does not require every consumer role to
+permit `bash` or another safe operation. If a surface declares a safe-read-only
+probe, it has declared that consumer-owned operation as permitted and the
+effective stack must explicitly resolve it to `allow`; `ask`, `deny`, and
+`unproven` are drift. Classes with any non-`allow` safety disposition remain
+mandatory coverage and cannot be omitted to bypass the audit.
+
+The canonical profile policy binds the required executable authority surfaces:
+Global `build` is the approval-capable `parent`; Global subagents are `leaf`
+surfaces. Agent-Core `task-orchestrator` is the approval-capable `parent`; its
+depth-2 implementation and read-only agents are `leaf` surfaces. Roles such as
+`plan` that are not part of this permission boundary are not invented as
+semantic surfaces merely because their agent files exist. Surface IDs, source
+paths, and boundaries must match those canonical mappings, so a standalone
+JSON entry or benign file cannot satisfy an authority boundary.
+
+`signals` is a bounded consumer-owned declaration of supported outcome
+semantics. Canonical signal names are validated against
+`permission-semantics.toml`; a leaf surface participating in the local-delete
+contract must declare `NEEDS_APPROVAL`, while the surface's `parent` boundary
+declares the approval-capable authority. The manifest does not duplicate the
+canonical class-to-signal table or prompt wording. This is static declaration
+conformance only: it does not prove that an LLM follows a prompt, emits the
+signal at runtime, or supplies the required evidence.
+
+Consumers own the concrete probe inputs, complete permission maps, and
+OpenCode permission-pattern spelling. Permission differences unrelated to a
+declared probe are allowed. Audit diagnostics identify probe inputs by SHA-256
+rather than printing consumer-owned input text. The selected profile-owned
+agent sources must be real confined files.
+
+The check is static declared-probe conformance, not proof of runtime behavior.
+Missing manifests or sources report `MISSING UNEXPECTED_DRIFT`; malformed
+manifests or sources and declaration or action drift report
+`DIFF UNEXPECTED_DRIFT`. Strict audits return non-zero for either result. The
+check searches only the selected profile-owned bundle and does not search
+repository-local OpenCode layers.
+
 ## Intentionally not canonical
 
 Full permissions are intentionally not canonical. The contract does not
@@ -230,6 +316,12 @@ opencode-contract audit-consumer \
 ```
 
 Profile selection is mandatory and is never inferred from a directory name. Audits only inspect the supplied filesystem tree, so Nix store paths and other read-only source trees are supported. A strict audit exits non-zero for invalid policy, invalid consumer paths, `DIFF`, or `MISSING` results.
+
+Both existing audit-consumer commands now include the permission-conformance check:
+`opencode-contract audit-consumer` audits one explicitly selected profile, and
+`opencode-contract audit-consumers` audits the Global and Agent-Core pair. The
+backward-compatible `python tools/audit_consumers.py` entry point uses the
+same shared audit implementation.
 
 The original dual-consumer workflow remains compatible:
 

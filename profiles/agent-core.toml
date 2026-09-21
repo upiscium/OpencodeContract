@@ -14,6 +14,19 @@ invariants = [
   "Project Adapter policy and implementation are not OpencodeContract ownership.",
 ]
 
+[permission_surfaces]
+parent_roles = ["task-orchestrator"]
+leaf_roles = [
+  "architect",
+  "general",
+  "explore",
+  "verifier",
+  "reviewer",
+  "investigator",
+  "security-reviewer",
+  "scout",
+]
+
 [assignments.build]
 primary_model = "sol"
 authority = "main-orchestrator-no-direct-implementation"

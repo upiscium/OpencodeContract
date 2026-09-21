@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import copy
 import shutil
 import sys
 import tempfile
@@ -10,7 +12,51 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from audit_consumers import audit  # noqa: E402
+from policy_audit import (  # noqa: E402
+    _permission_contract_context,
+    audit_profile,
+    result_exit_code,
+)
 from validate_policy import load_policy, validate_policy  # noqa: E402
+
+
+PERMISSION_CLASSES = (
+    "safe-read-only",
+    "local-filesystem-delete",
+    "repository-history-destruction",
+    "remote-destructive-operation",
+    "privilege-escalation",
+    "system-store-destruction",
+)
+PERMISSION_PROBES = (
+    ("git status", "safe-read-only"),
+    ("rm -rf cache", "local-filesystem-delete"),
+    ("git reset --hard HEAD", "repository-history-destruction"),
+    ("git push --force origin main", "remote-destructive-operation"),
+    ("sudo command", "privilege-escalation"),
+    ("nix store delete /nix/store/example", "system-store-destruction"),
+)
+PARENT_BASH_PERMISSIONS = {
+    "*": "ask",
+    "git status*": "allow",
+    "rm*": "ask",
+    "git reset --hard*": "deny",
+    "git clean*": "deny",
+    "git push --force*": "deny",
+    "git push --delete*": "deny",
+    "sudo*": "deny",
+    "nix store delete*": "deny",
+}
+LEAF_BASH_PERMISSIONS = {
+    "*": "deny",
+    "rm*": "deny",
+    "git reset --hard*": "deny",
+    "git clean*": "deny",
+    "git push --force*": "deny",
+    "git push --delete*": "deny",
+    "sudo*": "deny",
+    "nix store delete*": "deny",
+}
 
 
 class PolicyContractTests(unittest.TestCase):
@@ -21,20 +67,94 @@ class PolicyContractTests(unittest.TestCase):
     def make_consumer_fixture(self, root: Path) -> tuple[Path, Path, Path, Path]:
         dotnix_root = root / "dotnix"
         templates_root = root / "Templates"
-        dotnix_agents = dotnix_root / "config.d/opencode/agents"
-        templates_agents = templates_root / "components/agent-core/.opencode/agents"
+        dotnix_bundle = dotnix_root / "config.d/opencode"
+        templates_bundle = templates_root / "components/agent-core"
+        dotnix_agents = dotnix_bundle / "agents"
+        templates_agents = templates_bundle / ".opencode/agents"
         dotnix_agents.mkdir(parents=True)
         templates_agents.mkdir(parents=True)
 
         models = self.docs["models"]["models"]
         roles = self.docs["roles"]["roles"]
-        for profile, directory in (("global", dotnix_agents), ("agent-core", templates_agents)):
-            for role, assignment in self.docs[profile]["assignments"].items():
+        for profile, bundle, directory in (
+            ("global", dotnix_bundle, dotnix_agents),
+            ("agent-core", templates_bundle, templates_agents),
+        ):
+            assignments = self.docs[profile]["assignments"]
+            surface_policy = self.docs[profile]["permission_surfaces"]
+            permission_context, context_errors = _permission_contract_context(
+                profile, self.docs
+            )
+            if context_errors or permission_context is None:
+                raise AssertionError(context_errors)
+            parent_roles = set(surface_policy["parent_roles"])
+            for role, assignment in assignments.items():
                 mode = roles[role]["kind"]
                 model = models[assignment["primary_model"]]["id"]
-                (directory / f"{role}.md").write_text(
-                    f"---\nmode: {mode}\nmodel: {model}\n---\n", encoding="utf-8"
+                role_permissions = (
+                    PARENT_BASH_PERMISSIONS
+                    if role in parent_roles
+                    else LEAF_BASH_PERMISSIONS
                 )
+                permission_lines = "\n".join(
+                    f"    {json.dumps(pattern)}: {action}"
+                    for pattern, action in role_permissions.items()
+                )
+                (directory / f"{role}.md").write_text(
+                    f"---\nmode: {mode}\nmodel: {model}\n"
+                    f"permission:\n  bash:\n{permission_lines}\n---\n",
+                    encoding="utf-8",
+                )
+
+            bundle.joinpath("opencode.json").write_text(
+                json.dumps({"permission": {"bash": PARENT_BASH_PERMISSIONS}}),
+                encoding="utf-8",
+            )
+            source_prefix = "agents" if profile == "global" else ".opencode/agents"
+            surface_roles = [
+                (role, "parent") for role in surface_policy["parent_roles"]
+            ] + [
+                (role, "leaf") for role in surface_policy["leaf_roles"]
+            ]
+            manifest_lines = [
+                "schema_version = 1",
+                'contract = "permission-semantics"',
+                f'profile = "{profile}"',
+            ]
+            for surface_id, boundary in surface_roles:
+                manifest_lines.extend(
+                    [
+                        "",
+                        "[[surfaces]]",
+                        f'id = "{surface_id}"',
+                        f'boundary = "{boundary}"',
+                        'base_source = "opencode.json"',
+                        f'agent_source = "{source_prefix}/{surface_id}.md"',
+                        'signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]',
+                    ]
+                )
+            for surface_id, boundary in surface_roles:
+                probes = tuple(
+                    (input_value, class_id)
+                    for input_value, class_id in PERMISSION_PROBES
+                    if boundary == "parent"
+                    or class_id in permission_context["mandatory_classes"]
+                )
+                for input_value, class_id in probes:
+                    manifest_lines.extend(
+                        [
+                            "",
+                            "[[probes]]",
+                            f'surface = "{surface_id}"',
+                            'tool = "bash"',
+                            f"input = {json.dumps(input_value)}",
+                            f'classes = ["{class_id}"]',
+                        ]
+                    )
+            bundle.joinpath("opencode-contract-permissions.toml").write_text(
+                "\n".join(manifest_lines) + "\n",
+                encoding="utf-8",
+            )
         return dotnix_root, templates_root, dotnix_agents, templates_agents
 
     def test_policy_is_valid(self) -> None:
@@ -73,6 +193,7 @@ class PolicyContractTests(unittest.TestCase):
             contract["unclassified_consumer_operation"],
         )
         self.assertTrue(contract["allow_requires_configured_role_permission"])
+
         self.assertEqual("deny-over-ask-over-allow", contract["overlap_resolution"])
         self.assertEqual(
             "BLOCKED-over-NEEDS_APPROVAL-over-none",
@@ -101,6 +222,36 @@ class PolicyContractTests(unittest.TestCase):
             for operation in classes
         }
         self.assertEqual(expected_matrix, actual_matrix)
+
+    def test_permission_coverage_condition_is_derived_from_canonical_policy(self) -> None:
+        context, errors = _permission_contract_context("global", self.docs)
+        self.assertEqual([], errors)
+        assert context is not None
+        self.assertEqual(["safe-read-only"], context["conditional_classes"])
+        self.assertNotIn("safe-read-only", context["mandatory_classes"])
+
+        flag_disabled = copy.deepcopy(self.docs)
+        flag_disabled["permission-semantics"]["contract"][
+            "allow_requires_configured_role_permission"
+        ] = False
+        context, errors = _permission_contract_context("global", flag_disabled)
+        self.assertEqual([], errors)
+        assert context is not None
+        self.assertEqual([], context["conditional_classes"])
+        self.assertIn("safe-read-only", context["mandatory_classes"])
+
+        one_boundary_not_allow = copy.deepcopy(self.docs)
+        for operation in one_boundary_not_allow["permission-semantics"][
+            "operation_classes"
+        ]:
+            if operation["id"] == "safe-read-only":
+                operation["leaf_disposition"] = "deny"
+                break
+        context, errors = _permission_contract_context("global", one_boundary_not_allow)
+        self.assertEqual([], errors)
+        assert context is not None
+        self.assertNotIn("safe-read-only", context["conditional_classes"])
+        self.assertIn("safe-read-only", context["mandatory_classes"])
 
     def test_permission_policy_has_no_concrete_command_literals(self) -> None:
         policy_text = (ROOT / "policy/permission-semantics.toml").read_text(
@@ -515,6 +666,21 @@ class PolicyContractTests(unittest.TestCase):
             errors = validate_policy(root)
             self.assertIn("policy/roles.toml: roles must be a table", errors)
 
+    def test_malformed_permission_contract_is_reported_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(ROOT / "policy", root / "policy")
+            shutil.copytree(ROOT / "profiles", root / "profiles")
+            (root / "policy/permission-semantics.toml").write_text(
+                "schema_version = 1\ncontract = \"invalid\"\n",
+                encoding="utf-8",
+            )
+            errors = validate_policy(root)
+            self.assertTrue(
+                any("policy/permission-semantics.contract: must be a table" in error for error in errors),
+                errors,
+            )
+
     def test_validator_rejects_duplicated_intentional_difference_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -588,6 +754,23 @@ class PolicyContractTests(unittest.TestCase):
         self.assertEqual(["agent-core"], task_orchestrator["profiles"])
         self.assertNotIn("task-orchestrator", self.docs["global"]["assignments"])
 
+    def test_permission_surface_mapping_binds_only_executable_authorities(self) -> None:
+        self.assertEqual(
+            ["build"],
+            self.docs["global"]["permission_surfaces"]["parent_roles"],
+        )
+        self.assertEqual(
+            ["task-orchestrator"],
+            self.docs["agent-core"]["permission_surfaces"]["parent_roles"],
+        )
+        for profile in ("global", "agent-core"):
+            surface_roles = {
+                *self.docs[profile]["permission_surfaces"]["parent_roles"],
+                *self.docs[profile]["permission_surfaces"]["leaf_roles"],
+            }
+            self.assertNotIn("plan", surface_roles)
+            self.assertTrue(surface_roles <= set(self.docs[profile]["assignments"]))
+
     def test_quota_family_is_defined_once_per_model(self) -> None:
         families = self.docs["models"]["quota_families"]
         for model in self.docs["models"]["models"].values():
@@ -637,6 +820,75 @@ class PolicyContractTests(unittest.TestCase):
                 if line.startswith("INTENTIONAL_DIFFERENCE") and "role=task-orchestrator" in line
             ]
             self.assertIn("INTENTIONAL_DIFFERENCE profile=global role=task-orchestrator expected=absent", differences)
+
+    def test_permission_fixture_is_conforming_for_both_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dotnix, templates, _, _ = self.make_consumer_fixture(Path(temporary))
+            consumers = {"global": dotnix, "agent-core": templates}
+            for profile, consumer in consumers.items():
+                with self.subTest(profile=profile):
+                    lines, counts = audit_profile(profile, consumer, self.docs)
+                    self.assertEqual(0, counts["DIFF"], lines)
+                    self.assertEqual(0, counts["MISSING"], lines)
+                    surface_roles = [
+                        *self.docs[profile]["permission_surfaces"]["parent_roles"],
+                        *self.docs[profile]["permission_surfaces"]["leaf_roles"],
+                    ]
+                    permission_context, context_errors = _permission_contract_context(
+                        profile, self.docs
+                    )
+                    self.assertEqual([], context_errors)
+                    assert permission_context is not None
+                    mandatory_classes = set(permission_context["mandatory_classes"])
+                    for surface in surface_roles:
+                        observed = {
+                            class_id
+                            for _, class_id in PERMISSION_PROBES
+                            if any(
+                                line.startswith(f"PASS profile={profile} surface={surface} ")
+                                and f"classes={class_id}" in line
+                                for line in lines
+                            )
+                        }
+                        self.assertTrue(mandatory_classes <= observed, surface)
+                    self.assertTrue(
+                        any(
+                            line.startswith(f"PASS profile={profile} surface={surface} ")
+                            and "classes=safe-read-only" in line
+                            for surface in self.docs[profile]["permission_surfaces"]["parent_roles"]
+                            for line in lines
+                        ),
+                        lines,
+                    )
+                    self.assertFalse(
+                        any(
+                            line.startswith(f"PASS profile={profile} surface={surface} ")
+                            and "classes=safe-read-only" in line
+                            for surface in self.docs[profile]["permission_surfaces"]["leaf_roles"]
+                            for line in lines
+                        ),
+                        lines,
+                    )
+                    bundle = (
+                        consumer / "config.d/opencode"
+                        if profile == "global"
+                        else consumer / "components/agent-core"
+                    )
+                    self.assertTrue((bundle / "opencode-contract-permissions.toml").is_file())
+                    self.assertEqual(
+                        PARENT_BASH_PERMISSIONS,
+                        json.loads((bundle / "opencode.json").read_text(encoding="utf-8"))[
+                            "permission"
+                        ]["bash"],
+                    )
+
+    def test_permission_manifest_missing_is_strict_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dotnix, _, _, _ = self.make_consumer_fixture(Path(temporary))
+            (dotnix / "config.d/opencode/opencode-contract-permissions.toml").unlink()
+            lines, counts = audit_profile("global", dotnix, self.docs)
+            self.assertEqual(1, counts["MISSING"], lines)
+            self.assertEqual(1, result_exit_code(lines, counts, strict=True))
 
     def test_matching_primary_models_and_modes_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -712,7 +964,7 @@ class PolicyContractTests(unittest.TestCase):
             (dotnix_agents / "build.md").unlink()
             (templates_agents / "build.md").unlink()
             _, counts = audit(dotnix, templates, ROOT)
-            self.assertEqual(2, counts["MISSING"])
+            self.assertEqual(8, counts["MISSING"])
 
     def test_model_availability_contract_is_accepted(self) -> None:
         availability = self.docs["model-availability"]["policy"]
