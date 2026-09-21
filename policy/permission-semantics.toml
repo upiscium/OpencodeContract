@@ -1,0 +1,169 @@
+schema_version = 1
+
+[contract]
+id = "permission-semantics"
+closed_world = true
+scope = "bounded-cross-consumer-safety"
+classification_input = "consumer-mapped-semantic-class"
+profiles = ["global", "agent-core"]
+authorities = ["approval-capable-parent", "non-interactive-leaf"]
+operation_classes = [
+  "safe-read-only",
+  "local-filesystem-delete",
+  "repository-history-destruction",
+  "remote-destructive-operation",
+  "privilege-escalation",
+  "system-store-destruction",
+]
+dispositions = ["allow", "ask", "deny"]
+escalation_outcomes = ["none", "NEEDS_APPROVAL", "BLOCKED"]
+allow_requires_configured_role_permission = true
+overlap_resolution = "deny-over-ask-over-allow"
+overlap_escalation_resolution = "BLOCKED-over-NEEDS_APPROVAL-over-none"
+unclassified_consumer_operation = "consumer-owned-outside-contract"
+unknown_operation_class = "BLOCKED"
+unknown_profile = "BLOCKED"
+unknown_authority = "BLOCKED"
+out_of_authority = "BLOCKED"
+required_invariant_ids = [
+  "bounded-safety-semantics-canonical",
+  "permission-map-implementation-owned",
+  "leaf-no-direct-ask-execution-permission-mutation",
+  "no-permission-bypass",
+  "parent-independent-reevaluation-no-relay",
+  "out-of-authority-blocked",
+  "user-rejection-exact-operation-final",
+  "needs-approval-minimum",
+  "needs-decision-not-approval",
+  "canonical-policy-no-shell-literals",
+]
+
+[authorities."approval-capable-parent"]
+interactive = true
+can_ask = true
+can_execute_non_escalated = true
+can_execute_approval_required = true
+can_execute_denied = false
+can_mutate_permissions = false
+can_bypass = false
+independent_reevaluation = true
+relay_leaf_request = false
+auto_approve_escalation = false
+
+[authorities."non-interactive-leaf"]
+interactive = false
+can_ask = false
+can_execute_non_escalated = true
+can_execute_approval_required = false
+can_execute_denied = false
+can_mutate_permissions = false
+can_bypass = false
+independent_reevaluation = false
+relay_leaf_request = false
+auto_approve_escalation = false
+escalation_behavior = "return-outcome-to-parent"
+
+[[profile_bindings]]
+profile = "global"
+parent_authority = "approval-capable-parent"
+leaf_authority = "non-interactive-leaf"
+
+[[profile_bindings]]
+profile = "agent-core"
+parent_authority = "approval-capable-parent"
+leaf_authority = "non-interactive-leaf"
+
+[[operation_classes]]
+id = "safe-read-only"
+parent_disposition = "allow"
+leaf_disposition = "allow"
+parent_escalation = "none"
+leaf_escalation = "none"
+category = "safe"
+
+[[operation_classes]]
+id = "local-filesystem-delete"
+parent_disposition = "ask"
+leaf_disposition = "deny"
+parent_escalation = "none"
+leaf_escalation = "NEEDS_APPROVAL"
+category = "bounded-destructive"
+
+[[operation_classes]]
+id = "repository-history-destruction"
+parent_disposition = "deny"
+leaf_disposition = "deny"
+parent_escalation = "BLOCKED"
+leaf_escalation = "BLOCKED"
+category = "structural-destructive"
+
+[[operation_classes]]
+id = "remote-destructive-operation"
+parent_disposition = "deny"
+leaf_disposition = "deny"
+parent_escalation = "BLOCKED"
+leaf_escalation = "BLOCKED"
+category = "structural-destructive"
+
+[[operation_classes]]
+id = "privilege-escalation"
+parent_disposition = "deny"
+leaf_disposition = "deny"
+parent_escalation = "BLOCKED"
+leaf_escalation = "BLOCKED"
+category = "authority-change"
+
+[[operation_classes]]
+id = "system-store-destruction"
+parent_disposition = "deny"
+leaf_disposition = "deny"
+parent_escalation = "BLOCKED"
+leaf_escalation = "BLOCKED"
+category = "structural-destructive"
+
+[signals.NEEDS_APPROVAL]
+kind = "permission-escalation"
+interactive_boundary = "approval-capable-parent"
+terminal = false
+leaf_direct_ask = false
+leaf_direct_execution = false
+leaf_permission_mutation = false
+permission_bypass = false
+parent_independent_reevaluation = true
+parent_relay = false
+parent_auto_approve = false
+leaf_executes_denied_operation = false
+out_of_authority = "BLOCKED"
+user_rejection = "final-for-exact-operation-within-task"
+rejection_bypass_methods_forbidden = [
+  "retry",
+  "rephrase",
+  "redelegation",
+  "equivalent-substitute",
+]
+required_evidence = [
+  "operation_class",
+  "operation_identity",
+  "scope",
+  "purpose",
+  "evidence",
+  "least_privilege",
+  "safe_alternatives",
+  "configured_authority",
+]
+
+[signals.NEEDS_DECISION]
+kind = "requirements-product-or-architecture-ambiguity"
+interactive_boundary = "only-when-human-judgment-required"
+terminal = false
+permission_approval_resolves = false
+parent_must_resolve_from_contract_or_evidence = true
+leaf_direct_ask = false
+permission_denial_resolution = "not-an-approval-path"
+required_evidence = [
+  "ambiguity",
+  "known_evidence",
+  "requirements_or_product_or_architecture",
+  "options",
+  "recommendation",
+]

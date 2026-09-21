@@ -44,6 +44,13 @@ There is no dependency from OpencodeContract to Templates Agent Core generation 
 
 Neither complete prompt implementations nor command/skill implementations move here. OpencodeContract does not generate, materialize, synchronize, or modify either consumer.
 
+Across both consumers, each implementation owns its complete permission map,
+including OpenCode glob/pattern spelling and prompt wording. Consumers also own
+their guarded APIs and Task lifecycle; in the current profiles, Templates owns
+the guarded Git/GitHub APIs and Agent-Core Task lifecycle described above. Each
+consumer owns its provider, UI, and machine details. Those implementation
+choices remain outside this contract.
+
 ## Profiles
 
 ### Global Profile
@@ -61,6 +68,7 @@ The same role identity does not imply identical prompts, permissions, or authori
 - `policy/models.toml`: model aliases, exact provider IDs, and quota families. Provider model literals appear only here.
 - `policy/roles.toml`: canonical role taxonomy, profile applicability, and primary/subagent classification.
 - `policy/model-availability.toml`: fixed-model availability, fail-closed, and exact failure-reporting requirements.
+- `policy/permission-semantics.toml`: semantic permission classes, required parent/leaf dispositions, escalation outcomes, and bounded cross-consumer safety semantics. It contains no shell command literals.
 - `policy/invariants.toml`: common invariants and value-free declarations of allowed profile differences. Compared values are derived from canonical role/profile data.
 - `profiles/*.toml`: profile-specific primary assignments, authority semantics, and ownership.
 
@@ -92,9 +100,102 @@ Each applicable role has one fixed configured model. Model substitution and alte
 
 When the configured provider/model cannot execute the bounded objective, the result is `BLOCKED` and the exact provider/model failure is reported. OpencodeContract guarantees policy consistency, not provider or model availability. Quality-preserving execution under this policy requires the configured GPT-5.6 role model.
 
+## Permission semantics
+
+OpencodeContract owns the bounded semantic part of permissions shared by both
+consumers: operation classes, required `allow`/`ask`/`deny` dispositions,
+escalation outcomes, and cross-consumer safety invariants. The contract has an
+approval-capable parent boundary and a non-interactive leaf boundary. A
+consumer maps these semantics to its own complete permission map; the map's
+OpenCode glob/pattern spelling, prompts, guarded APIs, and runtime details are
+not canonical here.
+
+The closed-world operation classes and required dispositions are:
+
+| Class | Parent disposition | Leaf disposition | Escalation |
+| --- | --- | --- | --- |
+| `safe-read-only` | `allow` | `allow` | none |
+| `local-filesystem-delete` | `ask` | `deny` | `NEEDS_APPROVAL` |
+| `repository-history-destruction` | `deny` | `deny` | `BLOCKED` |
+| `remote-destructive-operation` | `deny` | `deny` | `BLOCKED` |
+| `privilege-escalation` | `deny` | `deny` | `BLOCKED` |
+| `system-store-destruction` | `deny` | `deny` | `BLOCKED` |
+
+The `allow` disposition is conditional: a consumer may allow a safe/read-only
+operation only where its configured role permission permits it. The contract
+does not define that role permission map.
+
+This is a bounded classification contract, not an exhaustive taxonomy of every
+operation a consumer may implement. The closed world is closed over the six
+semantic class identifiers after a consumer supplies a semantic classification.
+Consumer operations outside this bounded safety boundary remain consumer-owned
+and are not silently assigned a canonical disposition. An unknown or malformed
+class identifier presented to this contract is fail-closed as `BLOCKED`.
+When a consumer's classification overlaps more than one canonical class, the
+most restrictive result wins: `deny` takes precedence over `ask`, which takes
+precedence over `allow`; for escalation outcomes, `BLOCKED` takes precedence
+over `NEEDS_APPROVAL`, which takes precedence over `none`. A structural or
+privileged classification therefore cannot be downgraded to the local-delete
+approval path.
+
+Local filesystem deletion is the bounded approval path: the parent asks the
+user, while the leaf denies direct execution and returns `NEEDS_APPROVAL`.
+`NEEDS_APPROVAL` is the minimum non-terminal escalation outcome; it grants no
+execution authority and must identify the operation class and operation,
+scope, purpose, evidence, least-privilege basis, safe alternatives, and
+configured authority for the approval-capable parent. Structural/history,
+remote, privilege, and system-store destruction remain denied at both
+boundaries and return `BLOCKED`; none becomes an approval path.
+
+The following are explanatory consumer-mapping examples only, not canonical
+command literals in this repository:
+
+| Semantic class | Example mappings |
+| --- | --- |
+| `local-filesystem-delete` | `rm`, `rm -r`, `rm -rf`, `rmdir` |
+| `repository-history-destruction` | `git reset --hard`, `git clean`, history rewriting |
+| `remote-destructive-operation` | force push, remote branch/tag deletion, repository deletion |
+| `privilege-escalation` | `sudo` |
+| `system-store-destruction` | `nix store delete` |
+
+Consumers classify their own concrete commands or guarded APIs; these examples
+must not be copied into the machine-readable contract as permission globs.
+
+The leaf never directly issues `Ask`, executes approval-required work, mutates
+permissions, or bypasses a required decision. The parent independently
+reevaluates a leaf escalation request, does not relay or auto-approve it, and
+must not retry, rephrase, redelegate, or replace an exact operation rejected by
+the user during the same task.
+Unknown class identifiers and out-of-authority profiles or authorities return
+`BLOCKED`. A user's rejection is final for the exact operation within the
+current task. `NEEDS_DECISION` is different from permission escalation: it is
+reserved for unresolved requirements, product, or architecture ambiguity that
+requires human judgment; approval cannot resolve it, and the parent must
+resolve it from the contract or available evidence.
+
+Canonical policy uses semantic class identifiers and outcomes, not shell
+command literals. This keeps bounded cross-consumer safety semantics canonical
+without making a consumer's complete permission map canonical.
+
+`policy/permission-semantics.toml` is the normative machine-readable source.
+The permission-related entries in `policy/invariants.toml` are cross-consumer
+invariant anchors linked to that source; the validator rejects missing or
+mislinked anchors.
+
 ## Intentionally not canonical
 
-The contract does not canonicalize full permissions, full agent prompts, commands, skills, provider credentials, UI preferences, Task implementation mechanics, Just recipes, or Project Adapter details. Semantic authority can differ by profile even when a role name and model assignment are shared.
+Full permissions are intentionally not canonical. The contract does not
+canonicalize complete permission maps, OpenCode glob/pattern spelling, full
+agent prompts, commands, skills, provider credentials, UI preferences, Task
+implementation mechanics, guarded API details, Just recipes, or Project
+Adapter details. Consumers own those implementation details, and semantic
+authority can differ by profile even when a role name and model assignment are
+shared.
+
+In contrast, the bounded cross-consumer safety semantics above are canonical:
+the six operation classes, their required dispositions and escalation outcomes,
+and the common safety invariants apply across consumers without prescribing
+their full permissions.
 
 ## Validate policy
 
@@ -106,7 +207,11 @@ python -m unittest discover -s tests -v
 opencode-contract validate
 ```
 
-The validator parses all TOML documents and checks semantic ID uniqueness, model/role/profile references, required fields, model ID syntax, applicability consistency, complete single-model assignments, intentional differences, and the fixed model-availability contract.
+The validator parses all TOML documents and checks semantic ID uniqueness,
+model/role/profile references, required fields, model ID syntax, applicability
+consistency, complete single-model assignments, intentional differences, the
+fixed model-availability contract, the closed permission-semantics schema, and
+the permission invariant anchors.
 
 ## Audit consumers
 
