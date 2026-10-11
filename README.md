@@ -1,5 +1,16 @@
 # OpencodeContract
 
+> [!IMPORTANT]
+> **Retired — October 11, 2026.** This repository is retained only as historical evidence. Its shared OpenCode policy, roles, model assignments, and cross-consumer conformance machinery are **not authoritative for active development**.
+>
+> **Current owners:** [dotnix](https://github.com/upiscium/dotnix) independently owns Global OpenCode policy ([PR #63](https://github.com/upiscium/dotnix/pull/63)); [KUMIKI / formerly Templates](https://github.com/upiscium/Templates) independently owns repository-local AgentCore policy and generated templates ([PR #224](https://github.com/upiscium/Templates/pull/224)). These owners removed the active OpencodeContract flake/CI/audit/updater dependencies from their current main branches. No replacement shared Contract/registry is intended.
+>
+> **Legacy installations:** Old pinned revisions and `opencode-contract-permissions.toml` files may still exist in users' or deployed repositories. Archiving this historical source neither changes those installations nor automatically deletes local files. Owners must decide and review any local upgrade or cleanup; retained root manifests are not consumed by current KUMIKI policy.
+>
+> See the [retirement Epic #19](https://github.com/upiscium/OpencodeContract/issues/19) for exact owner handoff, preserved history, and residual verification limits. **Everything below this notice documents the historical implementation and must not be followed as current integration instructions.**
+
+---
+
 OpencodeContract is the machine-readable shared contract for canonical OpenCode roles, models, availability invariants, optional compatibility extensions, and consumer conformance for the OpenCode configurations implemented by [`upiscium/dotnix`](https://github.com/upiscium/dotnix) and [`upiscium/Templates`](https://github.com/upiscium/Templates).
 
 > **OpencodeContract does not own the complete OpenCode configuration.**
